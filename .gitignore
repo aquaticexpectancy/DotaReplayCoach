@@ -1,0 +1,12 @@
+.env
+__pycache__/
+*.pyc
+reports/
+od_cache/
+# generated constant caches (re-downloaded on first run)
+heroes.json
+items.json
+item_keys.json
+abilities_meta.json
+ability_ids.json
+hero_ultimates.json

@@ -1,0 +1,9 @@
+requests>=2.31
+python-dotenv>=1.0
+flask>=3.0
+# Production servers (install the one for your host):
+gunicorn>=21.0     ; sys_platform != "win32"
+waitress>=3.0      ; sys_platform == "win32"
+# Used only by the offline map-calibration/verification scripts:
+pillow>=10.0
+numpy>=1.26
