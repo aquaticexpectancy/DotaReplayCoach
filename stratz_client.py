@@ -78,6 +78,24 @@ def _post(token: str, variables: dict) -> dict:
     return body["data"]["match"]
 
 
+_DOWNLOAD_MUTATION = "mutation ($id: Long!) { retryMatchDownload(matchId: $id) }"
+
+
+def request_download(match_id: int, token: str | None = None) -> bool:
+    """Ask STRATZ to download + parse this match now. Returns True if accepted.
+    This is the nudge that turns 'waiting for STRATZ' into 'STRATZ parsing now'."""
+    token = token or os.environ.get("STRATZ_TOKEN")
+    try:
+        r = requests.post(ENDPOINT,
+                          json={"query": _DOWNLOAD_MUTATION, "variables": {"id": match_id}},
+                          headers=_headers(token), timeout=30)
+        if r.status_code >= 400:
+            return False
+        return bool((r.json().get("data") or {}).get("retryMatchDownload"))
+    except Exception:
+        return False
+
+
 _FLAG_FIELDS = ("isDieBack", "isBurst", "isEngagedOnDeath", "isAttemptTpOut",
                 "hasHealAvailable", "isFeed", "isWardWalkThrough")
 
@@ -145,21 +163,32 @@ def _to_match(match_id: int, raw: dict) -> MatchData:
 
 
 def fetch_match(match_id: int, token: str | None = None,
-                wait: bool = True, poll_s: int = 20, timeout_s: int = 600) -> MatchData:
-    """Fetch a match, optionally polling until STRATZ has parsed it."""
+                wait: bool = True, poll_s: int = 15, timeout_s: int = 300,
+                log=print) -> MatchData:
+    """Fetch a match, nudging STRATZ to parse it if needed, then polling."""
     token = token or os.environ.get("STRATZ_TOKEN")
     if not token:
         raise RuntimeError("Set STRATZ_TOKEN (see .env.example).")
 
+    md = _to_match(match_id, _post(token, {"id": match_id}))
+    if md.parsed or not wait:
+        return md
+
+    # Not parsed — ask STRATZ to download + parse it now, then wait.
+    if request_download(match_id, token):
+        log("Asked STRATZ to parse this match — this can take a minute…")
+    else:
+        log("Waiting for STRATZ to parse this match…")
+
     deadline = time.time() + timeout_s
     while True:
-        raw = _post(token, {"id": match_id})
-        md = _to_match(match_id, raw)
-        if md.parsed or not wait:
+        time.sleep(poll_s)
+        md = _to_match(match_id, _post(token, {"id": match_id}))
+        if md.parsed:
             return md
         if time.time() > deadline:
             raise TimeoutError(
-                f"Match {match_id} still not parsed after {timeout_s}s. "
-                "Old matches may have no replay left to parse.")
-        print(f"  match not parsed yet, retrying in {poll_s}s...")
-        time.sleep(poll_s)
+                "STRATZ could not parse this match in time. If it's more than "
+                "~2 weeks old the replay has expired and can't be parsed anymore; "
+                "otherwise try again in a few minutes.")
+        log(f"Still parsing… retrying in {poll_s}s")

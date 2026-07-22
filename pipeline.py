@@ -53,7 +53,10 @@ def generate(match_id, account_id, *, wait_parse: bool = True,
                 "hero_id": None, "deaths": None, "cached": True, "partial": False}
 
     log(f"STRATZ: fetching match {match_id}…")
-    match = fetch_match(match_id)
+    try:
+        match = fetch_match(match_id, log=log)
+    except TimeoutError as e:
+        raise PipelineError(str(e))
     if not match.parsed:
         raise PipelineError(
             "STRATZ has no parsed replay for this match yet. Very recent or very "
