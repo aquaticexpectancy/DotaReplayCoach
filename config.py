@@ -46,3 +46,8 @@ WARD_COVER      = 13.0   # allied ward within this = death spot was lit
 FAR_LASTSEEN    = 32.0   # enemy last-known this far away = you had no recent info
 ROTATE_LOOKBACK = 8.0    # seconds: how far back "no enemies visible" looks
 TOWER_RANGE     = 9.0    # died within this of an enemy tower = a dive
+TOWER_VISION    = 14.8   # ~1900 world units: your towers light this radius
+DISPLACE_WINDOW  = 6.0   # seconds before death a hook/skewer can still explain it
+DISPLACE_MIN_LEAD = 0.5  # must land at least this long before the killing blow
+DISPLACE_MIN_MOVE = 3.0  # grid units (~380) you must actually be moved
+DISPLACE_MIN_CLOSE = 2.0 # grid units (~250) the gap to the caster must close

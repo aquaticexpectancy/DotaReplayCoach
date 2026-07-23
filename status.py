@@ -94,7 +94,7 @@ _ABILITY_STATUS = {
     "sandking_sand_storm": ("invis", 0.0, "self"),
     "omniknight_guardian_angel": ("immune", 6.0, "aoe_ally"),
     "omniknight_purification": ("heal", 0.2, "ally"),
-    "omniknight_repel": ("bkb", 10.0, "ally"),  # Heavenly Grace-ish older name
+    "omniknight_repel": ("immune", 10.0, "ally"),  # Heavenly Grace-ish older name
     "omniknight_martyr": ("heal", 6.0, "ally"),
     "abaddon_aphotic_shield": ("shield", 15.0, "ally"),
     "dazzle_shallow_grave": ("grave", 5.0, "ally"),
@@ -114,8 +114,10 @@ _ABILITY_STATUS = {
     "chen_hand_of_god": ("heal", 0.2, "aoe_ally"),
     "dawnbreaker_luminosity": ("lifesteal", 0.0, "self"),
     "huskar_life_break": ("lifesteal", 0.0, "self"),
-    "life_stealer_rage": ("bkb", 5.0, "self"),
-    "juggernaut_blade_fury": ("bkb", 5.0, "self"),
+    # These grant spell immunity but are NOT Black King Bar — labelling them
+    # "BKB" reads as though the hero pressed an item they may not even own.
+    "life_stealer_rage": ("immune", 5.0, "self"),
+    "juggernaut_blade_fury": ("immune", 5.0, "self"),
     "ember_spirit_flame_guard": ("shield", 12.0, "self"),
     "phoenix_fire_spirits": ("empower", 16.0, "self"),
     "keeper_of_the_light_chakra_magic": ("empower", 0.2, "ally"),
@@ -176,6 +178,20 @@ _ITEM_MAP_SKIP = {
 }
 
 AOE_RADIUS = 8.0  # ~1024 world units on the 128-grid
+
+# Abilities that physically move the VICTIM. A hero yanked by one of these did
+# not "walk into" anything — the label and the advice both need to know.
+PULLS_VICTIM = {
+    "pudge_meat_hook": "Hooked",
+    "magnataur_skewer": "Skewered",
+    "batrider_flaming_lasso": "Lassoed",
+    "tiny_toss": "Tossed",
+    "vengefulspirit_nether_swap": "Swapped",
+    "disruptor_glimpse": "Glimpsed",
+    "clockwerk_hookshot": "Hookshot",
+    "earth_spirit_boulder_smash": "Smashed",
+    "spirit_breaker_charge_of_darkness": "Charged",
+}
 
 
 def _hero_by_id(match: MatchData, hid: int | None) -> HeroTrack | None:

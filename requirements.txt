@@ -1,6 +1,7 @@
 requests>=2.31
 python-dotenv>=1.0
 flask>=3.0
+xai-sdk>=1.17         # AI coaching (optional — needs XAI_API_KEY in .env)
 # Production servers (install the one for your host):
 gunicorn>=21.0     ; sys_platform != "win32"
 waitress>=3.0      ; sys_platform == "win32"

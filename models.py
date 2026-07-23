@@ -53,6 +53,23 @@ class HeroTrack:
     health: list = field(default_factory=list)     # (time, hp, maxHp, mp, maxMp)
     levels: list = field(default_factory=list)     # (time, level)
     inventory: list = field(default_factory=list)  # (time, [itemIds main slots], neutralId)
+    ability_casts: list = field(default_factory=list)   # (time, abilityId, target)
+    item_casts: list = field(default_factory=list)      # (time, itemId, target)
+    # Attached by opendota.attach_economy(). Declared here (not just set
+    # dynamically) so a failed OpenDota fetch degrades to empty instead of
+    # raising AttributeError deep inside the renderer.
+    econ_times: list = field(default_factory=list)
+    lh_t: list = field(default_factory=list)
+    gold_t: list = field(default_factory=list)
+    purchase_log: list = field(default_factory=list)
+    final_items: list = field(default_factory=list)
+    final_neutral: int | None = None
+    lane_role: int | None = None                   # 1 safe, 2 mid, 3 off (OpenDota)
+    is_roaming: bool = False
+    stats: dict = field(default_factory=dict)      # end-of-match scoreboard line
+    dmg_received: dict = field(default_factory=dict)  # inflictor name -> damage
+    dmg_by_unit: dict = field(default_factory=dict)   # source unit -> damage
+    killed_by: dict = field(default_factory=dict)     # killer unit -> times
     ability_casts: list = field(default_factory=list)  # (time, ability_id, target)
     item_casts: list = field(default_factory=list)     # (time, item_id, target)
     # OpenDota per-minute economy (optional; attached in main.py)

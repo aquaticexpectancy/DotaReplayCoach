@@ -5,9 +5,13 @@ everything downstream (coach, card) just presents its output.
 """
 from __future__ import annotations
 from dataclasses import dataclass, field
+import abilities as abilities_mod
 import config as C
+import status as status_mod
 from models import MatchData, HeroTrack, DeathEvent, Position
 from positions import dist, pos_at, last_seen, active_wards, alive
+
+LANING_UNTIL = 600.0        # seconds; before this, "gank" framing is wrong
 
 
 @dataclass
@@ -23,7 +27,8 @@ class DeathAnalysis:
     enemies: list = field(default_factory=list)  # (hero_id, Position) at death
 
 
-def _features(match: MatchData, me: HeroTrack, death: DeathEvent) -> dict:
+def _features(match: MatchData, me: HeroTrack, death: DeathEvent,
+              ab_meta: dict) -> dict:
     t = death.time
     my_pos = Position(t, death.x, death.y)
 
@@ -36,18 +41,57 @@ def _features(match: MatchData, me: HeroTrack, death: DeathEvent) -> dict:
     nearest_ally = min((dist(my_pos, p) for _, p in allies), default=float("inf"))
     enemies_near = sum(dist(my_pos, p) < C.NEAR_ENEMY for _, p in enemy_pos)
 
-    # "no enemies visible" proxy: how many of the gankers were FAR away a few
-    # seconds earlier -> the player had no recent info on them.
+    # A rotation means someone who was FAR is now ON you. Counting every distant
+    # enemy (as this used to) made the three heroes standing in their own lanes
+    # look like a gank squad — which fired "unseen gank" on every laning death.
     gankers_were_far = 0
     for h in enemies_alive:
+        here = pos_at(h, t)
+        if not here or dist(my_pos, here) >= C.NEAR_ENEMY:
+            continue                      # not part of what killed you
         recent = last_seen(h, t - C.ROTATE_LOOKBACK)
         if recent and dist(my_pos, recent) > C.FAR_LASTSEEN:
             gankers_were_far += 1
 
-    warded = any(dist(my_pos, Position(t, w.x, w.y)) < C.WARD_COVER
-                 for w in active_wards(match.wards, t, me.is_radiant))
+    # Were you physically yanked out of position (hook, skewer, lasso...)?
+    # Two guards matter: the cast must land BEFORE the killing blow (a hook that
+    # lands at +0s did not cause the death), and your position must actually
+    # jump afterwards — otherwise it missed you.
+    displaced_by = None
+    for h in match.enemies_of(me):
+        for ct, aid, _tgt in h.ability_casts:
+            if not (t - C.DISPLACE_WINDOW <= ct <= t - C.DISPLACE_MIN_LEAD):
+                continue
+            key = (abilities_mod.info(aid, ab_meta) or {}).get("key") or ""
+            if key not in status_mod.PULLS_VICTIM:
+                continue
+            before, after = pos_at(me, ct), pos_at(me, ct + 1.5)
+            caster = pos_at(h, ct)
+            if not (before and after and caster):
+                continue
+            # A pull both moves you and closes the gap to the caster. Requiring
+            # both separates a landed hook from you simply walking (1s position
+            # sampling only captures part of the drag, so the bar must be low).
+            moved = dist(before, after)
+            closed = dist(before, caster) - dist(after, caster)
+            if moved >= C.DISPLACE_MIN_MOVE and closed >= C.DISPLACE_MIN_CLOSE:
+                displaced_by = status_mod.PULLS_VICTIM[key]
+                break
+        if displaced_by:
+            break
 
     dead_b = match.dead_buildings(t)
+    # Your own standing towers grant vision too — a death in tower range is not
+    # a "no vision" death, so count that before flagging the finding.
+    in_tower_vision = any(
+        b.is_radiant == me.is_radiant and b.kind == "tower" and b.key not in dead_b
+        and dist(my_pos, Position(t, b.x, b.y)) < C.TOWER_VISION
+        for b in match.buildings
+    )
+    warded = in_tower_vision or any(
+        dist(my_pos, Position(t, w.x, w.y)) < C.WARD_COVER
+        for w in active_wards(match.wards, t, me.is_radiant))
+
     near_enemy_tower = any(
         b.is_radiant != me.is_radiant and b.kind == "tower"
         and b.key not in dead_b
@@ -64,6 +108,8 @@ def _features(match: MatchData, me: HeroTrack, death: DeathEvent) -> dict:
         "in_enemy_half": C.on_enemy_half(death.x, death.y, me.is_radiant),
         "near_enemy_tower": near_enemy_tower,
         "gold_lost": death.gold_lost,
+        "displaced_by": displaced_by,
+        "laning": t < LANING_UNTIL,
         "_allies": allies,
         "_enemies": enemy_pos,
         "_me": my_pos,
@@ -83,10 +129,16 @@ def _classify(f: dict) -> tuple[str, float]:
     if f["in_enemy_half"]: score += 1
     score += min(f["gold_lost"] / 300.0, 3)
 
+    # Being yanked out of position outranks everything else — you didn't walk
+    # anywhere, so no "overextended"/"gank" framing applies.
+    if f.get("displaced_by"):
+        return f"{f['displaced_by']} out of position", score + 1
     if f["near_enemy_tower"] and ganked:
         return "Dove enemy tower", score + 1
-    if ganked and blind and f["in_enemy_half"]:
-        return "Pushed into a gank (no info)", score + 1   # the classic "death 3"
+    # A "gank" needs an actual rotation onto you. During laning, deaths are
+    # lane fights or pulls, not ganks — don't dress them up as one.
+    if ganked and blind and f["in_enemy_half"] and not f.get("laning"):
+        return "Pushed into a gank (no info)", score + 1
     if solo and f["in_enemy_half"] and ganked:
         return "Overextended pickoff", score
     if not f["warded"] and solo:
@@ -98,8 +150,9 @@ def _classify(f: dict) -> tuple[str, float]:
 
 def analyze_match(match: MatchData, me: HeroTrack) -> list[DeathAnalysis]:
     out: list[DeathAnalysis] = []
+    ab_meta = abilities_mod.load_meta()
     for i, death in enumerate(me.deaths):
-        f = _features(match, me, death)
+        f = _features(match, me, death, ab_meta)
         label, score = _classify(f)
         out.append(DeathAnalysis(
             index=i, time=death.time, label=label, score=round(score, 2),

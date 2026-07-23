@@ -137,7 +137,10 @@ def collapse_components(keys: list[str], by_key: dict | None = None) -> list[str
     hide: set[str] = set()
     for k in keys:
         for parent in parents.get(k, ()):
-            if parent in owned:
+            # An item is never its own parent. The boot table above lists
+            # "boots" among the upgrades, so Boots of Speed hid itself and
+            # blanked the whole early-game inventory.
+            if parent != k and parent in owned:
                 hide.add(k)
                 break
     return [k for k in keys if k not in hide]
@@ -154,18 +157,30 @@ def _row_for_key(k: str, by_key: dict) -> dict:
     }
 
 
-def snapshot_items(purchase_log: list, t: float, limit: int = 6) -> list[dict]:
-    """Dotabuff-style completed inventory estimate at time t from purchase_log."""
+def snapshot_items(purchase_log: list, t: float, limit: int = 6,
+                   include_minor: bool = False) -> list[dict]:
+    """Inventory estimate at time t from purchase_log.
+
+    `include_minor=True` keeps consumables and stat components (tangos,
+    branches, quelling blade) — what a spectator panel wants, since at minute
+    one a hero really does own tangos and branches and filtering them showed an
+    empty inventory. The default stays filtered because the coach's "what did
+    they build" reasoning only wants completed items.
+    """
     by_key = load_by_key()
     keys = [k for k in owned_keys_at(purchase_log, t)
-            if k not in _SKIP_KEYS and not k.startswith("recipe_")]
+            if not k.startswith("recipe_")
+            and (include_minor or k not in _SKIP_KEYS)]
     keys = collapse_components(keys, by_key)
     # Prefer valuable / recently bought completed items (like Dotabuff builds).
     scored = []
     for i, k in enumerate(keys):
         meta = by_key.get(k) or {}
         cost = meta.get("cost") or 0
-        scored.append((cost, i, k))
+        # With minor items included, recency decides — otherwise a 90g tango
+        # bought at 0:00 would outrank nothing and cheap stats would fill slots
+        # ahead of the item they just finished.
+        scored.append((0 if include_minor else cost, i, k))
     scored.sort(key=lambda r: (r[0], r[1]))
     # Keep the most expensive recent items, but preserve purchase order among them.
     keep = {k for _, _, k in scored[-limit:]}

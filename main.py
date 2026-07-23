@@ -22,6 +22,8 @@ def main():
                     help="re-request the OpenDota parse and rebuild even if cached")
     ap.add_argument("--no-wait-parse", action="store_true",
                     help="don't wait for an OpenDota parse (faster, maybe partial)")
+    ap.add_argument("--coach", action="store_true",
+                    help="add AI coaching (needs ANTHROPIC_API_KEY)")
     args = ap.parse_args()
 
     try:
@@ -29,6 +31,7 @@ def main():
             args.match_id, args.account,
             wait_parse=not args.no_wait_parse,
             force=args.force_parse,
+            coach=args.coach,
         )
     except pipeline.PipelineError as e:
         print(f"Error: {e}")

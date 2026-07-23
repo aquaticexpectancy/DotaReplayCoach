@@ -10,3 +10,9 @@ item_keys.json
 abilities_meta.json
 ability_ids.json
 hero_ultimates.json
+hero_abilities_by_id.json
+ability_flags.json
+valve_cache/
+meta_cache/
+# local editor / agent state
+.claude/

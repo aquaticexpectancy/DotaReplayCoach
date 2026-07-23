@@ -15,8 +15,10 @@ import os
 import config as C
 import heroes
 import items as items_mod
+import dota_live
 import abilities as abilities_mod
 import status as status_mod
+import diagnose as diagnose_mod
 from detect_deaths import DeathAnalysis
 from models import MatchData, HeroTrack
 from positions import alive, pos_at, hp_at, level_at, items_at
@@ -32,6 +34,11 @@ CAST_LOOKBACK = 10.0          # ability/item uses shown before death
 
 # Plain-English overrides for detector labels (detector keeps short keys).
 _LABEL_COPY = {
+    "Hooked out of position": {
+        "title": "Hooked out of position",
+        "blurb": "A hook landed and dragged you in — you did not walk into this.",
+        "tip": "Stand behind creeps or terrain that blocks the hook line when a hooker has vision on you.",
+    },
     "Dove enemy tower": {
         "title": "Dove under their tower",
         "blurb": "You died inside enemy tower range while enemies were on you.",
@@ -115,7 +122,15 @@ def _severity(score: float, label: str) -> dict:
 def _findings(f: dict) -> list[dict]:
     """Structured findings: short title + plain sentence (easy to scan)."""
     out: list[dict] = []
-    if f["nearest_ally"] > C.ISOLATED_ALLY:
+    if not math.isfinite(f["nearest_ally"]):
+        # No living ally anywhere — the detector's "distance" is infinite, and
+        # printing that as a number gives "about inf units away".
+        out.append({
+            "tone": "bad",
+            "title": "Alone",
+            "text": "Every ally was dead — there was no help on the map at all.",
+        })
+    elif f["nearest_ally"] > C.ISOLATED_ALLY:
         out.append({
             "tone": "bad",
             "title": "Alone",
@@ -147,12 +162,19 @@ def _findings(f: dict) -> list[dict]:
             "text": "At least one enemy was in threaten range when you went down.",
         })
 
+    if f.get("displaced_by"):
+        out.append({
+            "tone": "bad",
+            "title": f"{f['displaced_by']}",
+            "text": ("You were physically pulled out of position — this was not a "
+                     "movement decision, it was a landed ability."),
+        })
     if f["gankers_were_far"] >= 2:
         out.append({
             "tone": "bad",
             "title": "Unseen rotation",
-            "text": (f"{f['gankers_were_far']} of them were far away just "
-                     f"{C.ROTATE_LOOKBACK:.0f}s earlier — they rotated onto you."),
+            "text": (f"{f['gankers_were_far']} of the enemies on you had been far "
+                     f"away {C.ROTATE_LOOKBACK:.0f}s earlier — they rotated in."),
         })
 
     if f["warded"]:
@@ -263,7 +285,12 @@ def _farm_finding(track: HeroTrack, t: float) -> dict | None:
 
 def _story(f: dict, farm: dict | None) -> str:
     """Short lead-up story so the label makes sense without watching the clip."""
-    if f.get("gankers_were_far", 0) >= 2 and f.get("enemies_near", 0) >= 2:
+    if f.get("displaced_by"):
+        base = (f"Lead-up ends with a landed {f['displaced_by'].lower()} — you were "
+                "moved, so judge the positioning that made you catchable.")
+    elif f.get("laning") and f.get("enemies_near", 0) <= 2:
+        base = "Lead-up looks like a lane fight rather than a rotation."
+    elif f.get("gankers_were_far", 0) >= 2 and f.get("enemies_near", 0) >= 2:
         base = "Lead-up looks like a gank: enemies closed from far away."
     elif f.get("enemies_near", 0) >= 3 and f.get("nearest_ally", 99) < 10:
         base = "Lead-up looks like a teamfight: both sides were already stacked."
@@ -283,7 +310,18 @@ def _story(f: dict, farm: dict | None) -> str:
 
 
 def _copy_for(label: str) -> dict:
-    return _LABEL_COPY.get(label, _LABEL_COPY["Death"])
+    if label in _LABEL_COPY:
+        return _LABEL_COPY[label]
+    if label.endswith("out of position"):        # Skewered / Lassoed / Tossed…
+        verb = label.split(" out of")[0]
+        return {
+            "title": label,
+            "blurb": f"{verb} — you were physically moved, not out-positioned by "
+                     "your own movement.",
+            "tip": "Break the spacing or line of sight that made the cast possible; "
+                   "once it lands the death is usually already decided.",
+        }
+    return _LABEL_COPY["Death"]
 
 
 def _ult_status(track: HeroTrack, t: float, ab_meta: dict, ults: dict) -> dict | None:
@@ -332,6 +370,233 @@ def _ult_status(track: HeroTrack, t: float, ab_meta: dict, ults: dict) -> dict |
                  f"(used at {int(last//60)}:{int(last%60):02d})."),
         "remaining": round(rem, 1), "lastCast": last, "cooldown": cd,
     }
+
+
+_DMG_COLOUR = {"magical": "#60a5fa", "physical": "#fbbf24",
+               "pure": "#f472b6", "unknown": "#94a3b8"}
+
+
+def _damage_profile(me: HeroTrack, match: MatchData, ab_meta: dict,
+                    item_db: dict, hmeta) -> dict:
+    """What actually did the damage to this player, and of what type.
+
+    WHOLE-MATCH totals. OpenDota reports damage by inflictor for the match, not
+    per death, so this is deliberately presented as a match-level pattern and
+    never pinned to one death's clock.
+    """
+    by_key = items_mod.load_by_key()
+    ab_by_key = {}
+    for aid, meta in (ab_meta or {}).items():
+        k = (meta or {}).get("key")
+        if k:
+            ab_by_key[k] = int(aid)
+
+    # Damage type per ability comes from the same flags file the coach reads.
+    flags = dota_live._interaction_flags()
+
+    rows = []
+    for key, amount in (getattr(me, "dmg_received", {}) or {}).items():
+        if not amount or key in ("null", None):
+            continue                       # "null" is plain right-click damage
+        aid = ab_by_key.get(key)
+        item = by_key.get(key)
+        if aid is not None:
+            name = abilities_mod.info(aid, ab_meta).get("name") or key
+            icon = abilities_mod.info(aid, ab_meta).get("icon")
+            kind = "ability"
+        elif item:
+            name = item.get("name") or key.replace("_", " ").title()
+            icon = item.get("icon")
+            kind = "item"
+        else:
+            continue                       # unresolved engine name — don't guess
+        dt = (flags.get(key) or {}).get("damage_type") or "unknown"
+        rows.append({"name": name, "icon": icon, "kind": kind,
+                     "damage": int(amount), "type": dt.lower()})
+    rows.sort(key=lambda r: -r["damage"])
+
+    auto = int((getattr(me, "dmg_received", {}) or {}).get("null") or 0)
+    if auto:
+        rows.insert(0, {"name": "Right-click attacks", "icon": None,
+                        "kind": "attack", "damage": auto, "type": "physical"})
+
+    # Which enemy hero hurt you most, by unit rather than by ability.
+    per_hero = []
+    for unit, amount in (getattr(me, "dmg_by_unit", {}) or {}).items():
+        if not unit.startswith("npc_dota_hero_") or not amount:
+            continue
+        for h in match.enemies_of(me):
+            nm, ic = hmeta(h.hero_id)
+            if unit.endswith(nm.lower().replace(" ", "_").replace("'", "")):
+                per_hero.append({"name": nm, "icon": ic, "damage": int(amount),
+                                 "kills": int((getattr(me, "killed_by", {}) or {})
+                                              .get(unit) or 0)})
+                break
+    per_hero.sort(key=lambda r: -r["damage"])
+
+    total = sum(r["damage"] for r in rows) or 1
+    split = {}
+    for r in rows:
+        split[r["type"]] = split.get(r["type"], 0) + r["damage"]
+    return {
+        "sources": rows[:8],
+        "heroes": per_hero[:5],
+        "total": total,
+        "split": [{"type": k, "damage": v, "pct": round(100 * v / total)}
+                  for k, v in sorted(split.items(), key=lambda kv: -kv[1])],
+    }
+
+
+def _positions(team: list[HeroTrack]) -> dict[int, int]:
+    """hero_id -> role position 1..5 for one team.
+
+    Dota has no "position" field anywhere; it is inferred. OpenDota gives
+    `lane_role` (1 safe, 2 mid, 3 off, 4 jungle) and `is_roaming`, which fixes
+    the lane but not who in that lane was the core. Farm priority settles it:
+    within a lane the higher-GPM player is the core, the other is the support.
+    """
+    def gpm(h):
+        return (getattr(h, "stats", {}) or {}).get("gpm") or 0
+
+    def lane(h):
+        if getattr(h, "is_roaming", False):
+            return 4                       # roamers are supports, never cores
+        return getattr(h, "lane_role", None)
+
+    out: dict[int, int] = {}
+    pool = sorted(team, key=gpm, reverse=True)
+    supports: list = []
+
+    for want_lane, core_pos in ((2, 2), (1, 1), (3, 3)):
+        inlane = [h for h in pool if lane(h) == want_lane and h.hero_id not in out]
+        if inlane:
+            out[inlane[0].hero_id] = core_pos   # highest GPM in the lane
+            supports.extend(inlane[1:])         # anyone else there is the support
+    # Jungle, roaming and unknown-lane players fall through to the support pool.
+    supports.extend(h for h in pool if h.hero_id not in out
+                    and h not in supports)
+    supports.sort(key=gpm, reverse=True)
+
+    free = [p for p in (1, 2, 3, 4, 5) if p not in out.values()]
+    for h, p in zip(supports, free):
+        out[h.hero_id] = p
+    return out
+
+
+def _kit_of(hero_id: int, ab_meta: dict, hero_abs: dict) -> list[dict]:
+    """Static ability list for a hero — name, icon and how it is unlocked.
+
+    Valve's datafeed is the authority on what is actually in a hero's kit.
+    The id list also carries engine sub-abilities and placeholders — Rubick
+    alone contributes "Stolen Spell" twice, "Telekinesis Land" twice and two
+    "Rubick Hidden" entries, which is what overflowed his row with unnamed
+    skills. Anything Valve does not list is not a real ability, so drop it.
+    """
+    live_list = dota_live.hero_profile(hero_id).get("abilities") or []
+    live = {a.get("abilityId"): a for a in live_list if a.get("abilityId")}
+    out = []
+    for aid in (hero_abs.get(str(hero_id)) or []):
+        if abilities_mod.is_noise(aid, ab_meta):
+            continue
+        lv = live.get(aid)
+        if live and lv is None:
+            continue                      # not part of the real kit
+        lv = lv or {}
+        if lv.get("innate") or lv.get("passive"):
+            continue                      # no cooldown to show
+        nfo = abilities_mod.info(aid, ab_meta)
+        name = lv.get("name") or nfo.get("name") or ""
+        if not name or name.lower().startswith("ability "):
+            continue                      # unresolved id — never show a number
+        out.append({
+            "id": aid, "name": name, "icon": nfo.get("icon"),
+            "ult": bool(lv.get("is_ult")),
+            "req": "scepter" if lv.get("needs_scepter")
+                   else "shard" if lv.get("needs_shard") else None,
+        })
+    return out
+
+
+def _ult_is_passive(hero_id: int, ults: dict) -> bool:
+    """Tiny's Grow is an ultimate but cannot be cast at anyone."""
+    u = (ults or {}).get(str(hero_id)) or {}
+    aid = u.get("abilityId")
+    for a in (dota_live.hero_profile(hero_id).get("abilities") or []):
+        if a.get("abilityId") == aid:
+            return bool(a.get("passive"))
+    return False
+
+
+_SCEPTER_KEYS = {"ultimate_scepter", "ultimate_scepter_2", "aghanims_scepter"}
+_SHARD_KEYS = {"aghanims_shard"}
+
+
+def _upgrades_at(track: HeroTrack, t: float) -> dict:
+    """Does this hero own Aghanim's Scepter / Shard at time t?"""
+    log = getattr(track, "purchase_log", None) or []
+    return {
+        "scepter": items_mod.has_any(log, t, _SCEPTER_KEYS),
+        "shard": items_mod.has_any(log, t, _SHARD_KEYS),
+    }
+
+
+def _kit_state(track: HeroTrack, t: float, ab_meta: dict,
+               kit: list[dict], ult_id: int | None = None) -> list[int]:
+    """Per-ability state at time t, positional to `kit`.
+
+    -2 = not unlocked (scepter/shard ability they do not own yet),
+    -1 = ult not skilled yet, 0 = ready, >0 = seconds of cooldown left.
+    Cooldown is inferred from the last observed cast, so an ability we never
+    saw cast reads as ready rather than as a guess. Only the ultimate is
+    reported as unskilled, because level 6 is the only skill point we can
+    infer — basics we cannot know, so we never claim they are unavailable.
+    """
+    lvl = level_at(track, t) or 1
+    up = _upgrades_at(track, t)
+    out = []
+    for ab in kit:
+        aid = ab["id"]
+        if ab.get("req") and not up.get(ab["req"]):
+            out.append(-2)
+            continue
+        if ab.get("ult") and not abilities_mod.ult_rank_available(lvl):
+            out.append(-1)
+            continue
+        if ult_id is not None and aid == ult_id and not abilities_mod.ult_rank_available(lvl):
+            out.append(-1)
+            continue
+        last = None
+        for ct, ca, _ in track.ability_casts:
+            if ca == aid and ct <= t:
+                last = ct
+        cd = abilities_mod.cooldown(aid, lvl, ab_meta)
+        if last is None or cd is None:
+            out.append(0)
+        else:
+            out.append(int(max(0.0, cd - (t - last))))
+    return out
+
+
+def _live_stats(match: MatchData, track: HeroTrack, t: float) -> dict:
+    """Scoreboard line AS AT time t — never the end-of-match totals.
+
+    Showing final stats on a 1:19 frame is the same class of bug as showing
+    the finished build there: it reads as fact and is wrong by 20 minutes.
+    """
+    cs, gold = _econ_at(track, t)
+    kills = assists = 0
+    for other in match.players:
+        if other.is_radiant == track.is_radiant:
+            continue
+        for d in other.deaths:
+            if d.time > t:
+                continue
+            if d.killer == track.hero_id:
+                kills += 1
+            elif track.hero_id in (d.assists or []):
+                assists += 1
+    deaths = sum(1 for d in track.deaths if d.time <= t)
+    return {"k": kills, "d": deaths, "a": assists, "cs": cs, "gold": gold}
 
 
 def _cast_feed(tracks: list[HeroTrack], t: float, ab_meta: dict,
@@ -463,48 +728,132 @@ def _loadout_row(h, t, item_db, hmeta, killers) -> dict:
 
 
 def _inventory_for(track: HeroTrack, t: float, item_db: dict) -> list[dict]:
-    """Best-effort inventory at time t (purchase log → STRATZ → end items)."""
-    inv = items_mod.snapshot_items(track.purchase_log, t)
-    if inv:
-        return inv
+    """Inventory at time t, from time-accurate sources ONLY.
+
+    Deliberately never falls back to `final_items`: those are the END-OF-MATCH
+    items, so using them here showed a finished build on a 1-minute death. An
+    empty list is the correct answer for an early death — say so, don't invent.
+    """
+    if track.purchase_log:
+        # Authoritative and timestamped. Minor items included so a minute-one
+        # inventory shows the tangos and branches they actually held.
+        return items_mod.snapshot_items(track.purchase_log, t, include_minor=True)
     main_ids, _neutral = items_at(track, t)
     if main_ids:
         return items_mod.from_item_ids(main_ids, item_db)
-    return items_mod.from_item_ids(track.final_items or [], item_db)
+    return []
 
 
-def _ult_cast_events(match: MatchData, me: HeroTrack, t0: float, t1: float,
-                     ab_meta: dict, ults: dict, hmeta) -> list[dict]:
-    """Ultimate casts in [t0, t1] with map positions for playback overlays."""
-    ult_by_hero = {int(hid): u for hid, u in ults.items()}
+# Abilities that move the VICTIM. A hero yanked by one of these shows a big
+# position jump that is NOT their own mobility — calling it "Blink" is wrong.
+_PULLS_VICTIM = {
+    "pudge_meat_hook": "Hooked",
+    "magnataur_skewer": "Skewered",
+    "batrider_flaming_lasso": "Lassoed",
+    "tiny_toss": "Tossed",
+    "vengefulspirit_nether_swap": "Swapped",
+    "disruptor_glimpse": "Glimpsed",
+    "clockwerk_hookshot": "Hookshot",
+    "earth_spirit_boulder_smash": "Smashed",
+    "spirit_breaker_charge_of_darkness": "Charged",
+}
+# Abilities that move the CASTER themselves.
+_SELF_MOVE = {
+    "antimage_blink": "Blink", "queenofpain_blink": "Blink",
+    "faceless_void_time_walk": "Time Walk", "riki_blink_strike": "Blink Strike",
+    "storm_spirit_ball_lightning": "Ball Lightning", "slark_pounce": "Pounce",
+    "mirana_leap": "Leap", "sandking_burrowstrike": "Burrowstrike",
+    "ember_spirit_fire_remnant": "Remnant", "puck_illusory_orb": "Orb",
+    "morphling_waveform": "Waveform", "spectre_haunt": "Haunt",
+    "nyx_assassin_vendetta": "Vendetta", "life_stealer_infest": "Infest",
+}
+_JUMP_WINDOW = 2.0          # seconds a cast can explain a jump
+_JUMP_PX = 22               # px between frames that counts as a teleport-sized jump
+# Towers grant vision. Dota daytime tower vision is ~1900 units.
+TOWER_VISION_UNITS = 1900
+
+
+def _explain_jump(match: MatchData, hero: HeroTrack, t: float,
+                  ab_meta: dict, item_db: dict) -> str | None:
+    """Name the cause of a position jump, or None if we genuinely don't know.
+
+    Guessing "Blink" for any mid-range jump was producing false blinks for
+    heroes who never owned one — most visibly a Pudge hook on the victim.
+    """
+    lo = t - _JUMP_WINDOW
+    # 1. Did an enemy yank them?
+    for other in match.players:
+        if other.is_radiant == hero.is_radiant:
+            continue
+        for ct, aid, _tgt in other.ability_casts:
+            if lo <= ct <= t + 0.3:
+                key = (abilities_mod.info(aid, ab_meta) or {}).get("key") or ""
+                if key in _PULLS_VICTIM:
+                    return _PULLS_VICTIM[key]
+    # 2. Did they move themselves with a spell?
+    for ct, aid, _tgt in hero.ability_casts:
+        if lo <= ct <= t + 0.3:
+            key = (abilities_mod.info(aid, ab_meta) or {}).get("key") or ""
+            if key in _SELF_MOVE:
+                return _SELF_MOVE[key]
+    # 3. Did they press a mobility item?
+    for ct, iid, _tgt in hero.item_casts:
+        if lo <= ct <= t + 0.3:
+            key = (item_db.get(str(iid)) or {}).get("key") or ""
+            if key in items_mod.BLINK_KEYS:
+                return "Blink"
+            if key in items_mod.FORCE_KEYS:
+                return "Force"
+            if key in items_mod.TP_ITEM_KEYS:
+                return "TP"
+    return None
+
+
+def _cast_events(match: MatchData, me: HeroTrack, t0: float, t1: float,
+                 ab_meta: dict, ults: dict, item_db: dict, hmeta) -> list[dict]:
+    """Every notable ability + item cast in [t0, t1], positioned for playback.
+
+    Not just ultimates — a Meat Hook or a Blink is exactly what you need to see
+    to understand a death, so all non-noise casts are included.
+    """
+    ult_ids = {u["abilityId"] for u in ults.values()}
     events = []
     for tr in match.players:
-        ult = ult_by_hero.get(tr.hero_id)
-        if not ult:
-            continue
-        aid = ult["abilityId"]
-        for ct, ca, _target in tr.ability_casts:
-            if ca != aid:
-                continue
+        name, hic = hmeta(tr.hero_id)
+        for ct, aid, _tgt in tr.ability_casts:
             if ct < t0 - 0.05 or ct > t1 + 0.05:
                 continue
+            if abilities_mod.is_noise(aid, ab_meta):
+                continue
             info = abilities_mod.info(aid, ab_meta)
+            pos = pos_at(tr, ct)
+            if not pos or not info.get("icon"):
+                continue
+            x, y = P(pos.x, pos.y)
+            events.append({
+                "t": round(ct, 2), "rel": round(ct - t1, 1),
+                "heroId": tr.hero_id, "hero": name, "heroIcon": hic,
+                "name": info.get("name") or "Ability", "icon": info.get("icon"),
+                "x": x, "y": y, "isRadiant": tr.is_radiant,
+                "me": tr is me, "ult": aid in ult_ids, "kind": "ability",
+            })
+        for ct, iid, _tgt in tr.item_casts:
+            if ct < t0 - 0.05 or ct > t1 + 0.05:
+                continue
+            meta = item_db.get(str(iid)) or {}
+            key = meta.get("key") or ""
+            if not key or key in status_mod._ITEM_MAP_SKIP or not meta.get("icon"):
+                continue
             pos = pos_at(tr, ct)
             if not pos:
                 continue
             x, y = P(pos.x, pos.y)
-            name, hic = hmeta(tr.hero_id)
             events.append({
-                "t": round(ct, 2),
-                "rel": round(ct - t1, 1),
-                "heroId": tr.hero_id,
-                "hero": name,
-                "heroIcon": hic,
-                "name": info.get("name") or ult.get("name") or "Ultimate",
-                "icon": info.get("icon") or ult.get("icon"),
-                "x": x, "y": y,
-                "isRadiant": tr.is_radiant,
-                "me": tr is me,
+                "t": round(ct, 2), "rel": round(ct - t1, 1),
+                "heroId": tr.hero_id, "hero": name, "heroIcon": hic,
+                "name": meta.get("name") or key, "icon": meta.get("icon"),
+                "x": x, "y": y, "isRadiant": tr.is_radiant,
+                "me": tr is me, "ult": False, "kind": "item",
             })
     events.sort(key=lambda e: e["t"])
     return events
@@ -513,7 +862,7 @@ def _ult_cast_events(match: MatchData, me: HeroTrack, t0: float, t1: float,
 def _build_playback(match: MatchData, me: HeroTrack, death_t: float,
                     death_xy: tuple[float, float], killers: set, hmeta,
                     ab_meta: dict | None = None, ults: dict | None = None,
-                    item_db: dict | None = None) -> dict:
+                    item_db: dict | None = None, kits: dict | None = None) -> dict:
     """Frame strip from (death - 10s) → death so the user can scrub the lead-up."""
     t0 = max(death_t - PLAYBACK_BEFORE, -90.0)
     frames = []
@@ -530,6 +879,7 @@ def _build_playback(match: MatchData, me: HeroTrack, death_t: float,
         status_iv = status_mod.build_status_intervals(
             match, ab_meta, item_db, t0, death_t)
 
+    prev_xy: dict[int, tuple[float, float]] = {}
     for ft in times:
         markers = []
         at_death = abs(ft - death_t) < 1e-6
@@ -542,6 +892,20 @@ def _build_playback(match: MatchData, me: HeroTrack, death_t: float,
                     if row:
                         m["hp"], m["maxHp"], m["mp"], m["maxMp"] = row
                 m["statuses"] = status_mod.statuses_at(status_iv, h.hero_id, ft)
+                if kits and ab_meta is not None:
+                    u = (ults or {}).get(str(h.hero_id)) or {}
+                    m["ab"] = _kit_state(h, ft, ab_meta,
+                                         kits.get(str(h.hero_id)) or [],
+                                         u.get("abilityId"))
+                m["live"] = _live_stats(match, h, ft)
+                m["up"] = _upgrades_at(h, ft)
+                # Explain any teleport-sized jump from the previous frame using
+                # actual cast data, rather than guessing from distance alone.
+                prev = prev_xy.get(h.hero_id)
+                if prev and ab_meta is not None and item_db is not None:
+                    if math.hypot(m["x"] - prev[0], m["y"] - prev[1]) >= _JUMP_PX:
+                        m["jump"] = _explain_jump(match, h, ft, ab_meta, item_db)
+                prev_xy[h.hero_id] = (m["x"], m["y"])
                 markers.append(m)
         wards = [{
             "x": P(w.x, w.y)[0], "y": P(w.x, w.y)[1],
@@ -562,43 +926,54 @@ def _build_playback(match: MatchData, me: HeroTrack, death_t: float,
         if t0 - 0.5 <= p.time <= death_t + 0.05:
             x, y = P(p.x, p.y)
             me_path.append({"t": p.time, "x": x, "y": y})
-    ult_casts = []
-    item_casts = []
-    if ab_meta is not None and ults is not None:
-        ult_casts = _ult_cast_events(match, me, t0, death_t, ab_meta, ults, hmeta)
-    if item_db is not None:
-        item_casts = status_mod.build_item_map_events(
-            match, me, t0, death_t, item_db, hmeta, P)
+    casts = []
+    if ab_meta is not None and ults is not None and item_db is not None:
+        casts = _cast_events(match, me, t0, death_t, ab_meta, ults, item_db, hmeta)
     return {
         "t0": round(t0, 2),
         "t1": round(death_t, 2),
         "step": PLAYBACK_STEP,
         "frames": frames,
         "mePath": me_path,
-        "ultCasts": ult_casts,
-        "itemCasts": item_casts,
+        "casts": casts,
     }
 
 
-def build_report(match: MatchData, me: HeroTrack, analyses: list[DeathAnalysis]) -> dict:
+def build_report(match: MatchData, me: HeroTrack, analyses: list[DeathAnalysis],
+                 coach_advice: dict | None = None) -> dict:
     hero = heroes.load()
     item = items_mod.load()
     ab_meta = abilities_mod.load_meta()
+    hero_abs = abilities_mod.load_hero_abilities()
+    # Kits are static per hero — ship them once and let frames carry only state.
+    kits = {str(h.hero_id): _kit_of(h.hero_id, ab_meta, hero_abs)
+            for h in match.players}
     ults = abilities_mod.load_ultimates()
 
     def hmeta(hid):
         h = hero.get(str(hid), {})
         return h.get("name", f"hero {hid}"), h.get("icon")
 
-    # In-game style scoreboard order: Radiant left, Dire right.
+    # In-game style scoreboard order: Radiant left, Dire right, each sorted 1-5.
     scoreboard = {"radiant": [], "dire": []}
-    for h in match.players:
-        name, ic = hmeta(h.hero_id)
-        row = {
-            "heroId": h.hero_id, "name": name, "icon": ic,
-            "isRadiant": h.is_radiant, "me": h is me,
-        }
-        (scoreboard["radiant"] if h.is_radiant else scoreboard["dire"]).append(row)
+    for side in (True, False):
+        team = [h for h in match.players if h.is_radiant == side]
+        pos = _positions(team)
+        for h in sorted(team, key=lambda p: pos.get(p.hero_id, 9)):
+            name, ic = hmeta(h.hero_id)
+            (scoreboard["radiant"] if side else scoreboard["dire"]).append({
+                "heroId": h.hero_id, "name": name, "icon": ic,
+                "isRadiant": h.is_radiant, "me": h is me,
+                "pos": pos.get(h.hero_id),
+                "stats": getattr(h, "stats", {}) or {},
+            })
+
+    # Per-death movement diagnosis (awareness vs execution), keyed by death index.
+    diags = {}
+    for a in analyses:
+        dg = diagnose_mod.movement(match, me, a)
+        if dg:
+            diags[a.index] = dg
 
     deaths = []
     for a in sorted(analyses, key=lambda x: x.time):
@@ -638,11 +1013,15 @@ def build_report(match: MatchData, me: HeroTrack, analyses: list[DeathAnalysis])
 
         # Prefer OpenDota purchase_log — STRATZ inventoryEvents are often empty.
         inv = _inventory_for(me, t, item)
+        # Neutral must come from a timestamped source. `final_neutral` is the
+        # end-of-match one, and showing it at 1:19 (before neutrals even drop)
+        # is a lie — so if we can't time it, we don't show it.
         neutral = None
-        if me.final_neutral:
-            n = item.get(str(me.final_neutral), {})
+        _ids, neutral_id = items_at(me, t)
+        if neutral_id:
+            n = item.get(str(neutral_id), {})
             if n:
-                neutral = {"name": n.get("name", f"item {me.final_neutral}"),
+                neutral = {"name": n.get("name", f"item {neutral_id}"),
                            "icon": n.get("icon")}
 
         killed_by = None
@@ -683,7 +1062,8 @@ def build_report(match: MatchData, me: HeroTrack, analyses: list[DeathAnalysis])
                 "tone": "warn",
                 "title": "Enemy Blink",
                 "text": (f"{', '.join(blink_enemies)} already had Blink Dagger — "
-                         "a sudden gap close is a blink, not a teleport."),
+                         "assume roughly 1200 units of instant gap close and "
+                         "keep that much more distance than feels necessary."),
             })
 
         my_ult = _ult_status(me, t, ab_meta, ults)
@@ -691,7 +1071,7 @@ def build_report(match: MatchData, me: HeroTrack, analyses: list[DeathAnalysis])
             if my_ult["state"] == "ready":
                 findings.insert(0, {
                     "tone": "warn", "title": f"{my_ult['name']} ready",
-                    "text": my_ult["text"] + " Check whether you should have used it.",
+                    "text": f"{my_ult['name']} was off cooldown when you died.",
                 })
             elif my_ult["state"] == "cooldown":
                 findings.insert(0, {
@@ -707,14 +1087,17 @@ def build_report(match: MatchData, me: HeroTrack, analyses: list[DeathAnalysis])
             name, ic = hmeta(h.hero_id)
             enemy_ults.append({
                 "heroId": h.hero_id, "hero": name, "heroIcon": ic,
+                "passive": _ult_is_passive(h.hero_id, ults),
                 **st,
             })
-        ready_enemy_ults = [u for u in enemy_ults if u.get("state") == "ready"]
+        ready_enemy_ults = [u for u in enemy_ults
+                            if u.get("state") == "ready" and not u.get("passive")]
         if ready_enemy_ults:
-            names = ", ".join(u["hero"] + " (" + u["name"] + ")" for u in ready_enemy_ults[:3])
+            names = ", ".join(u["hero"] + "'s " + u["name"] for u in ready_enemy_ults[:3])
             findings.insert(0, {
-                "tone": "bad", "title": "Enemy ult ready",
-                "text": f"Available against you: {names}.",
+                "tone": "bad", "title": "Enemy ults up",
+                "text": (f"{names} could be cast on you at that moment — "
+                         "that is the damage window you walked into."),
             })
 
         # Casts from everyone involved in the lead-up window.
@@ -739,6 +1122,7 @@ def build_report(match: MatchData, me: HeroTrack, analyses: list[DeathAnalysis])
         time_dead = (d.time_dead if d else 0) or 0
         deaths.append({
             "idx": a.index, "time": t, "clock": f"{mm}:{ss:02d}",
+            "diagnosis": diags.get(a.index),
             "label": a.label, "title": copy["title"], "blurb": copy["blurb"],
             "tip": copy["tip"], "story": story, "score": a.score, "severity": sev,
             "chips": _chips(d), "findings": findings,
@@ -758,7 +1142,7 @@ def build_report(match: MatchData, me: HeroTrack, analyses: list[DeathAnalysis])
             "casts": casts,
             "cost": {"gold": round(gold_lost), "respawn": round(time_dead)},
             "playback": _build_playback(match, me, t, death_xy, killers, hmeta,
-                                        ab_meta, ults, item),
+                                        ab_meta, ults, item, kits),
         })
 
     vision_px = 1600 / WORLD_PER_GRID / (C.GAME_MAX - C.GAME_MIN) * M
@@ -771,15 +1155,35 @@ def build_report(match: MatchData, me: HeroTrack, analyses: list[DeathAnalysis])
     notable_n = sum(1 for d in deaths if d["severity"]["key"] == "notable")
     focus_list_i = next((i for i, d in enumerate(deaths) if d is focus), 0) if focus else 0
 
+    habit = diagnose_mod.habits(match, me, analyses, diags, item, hmeta)
+
+    # Per-death AI advice + headline, keyed by death number.
+    # The AI rewrites the *displayed* title only; `label` stays the machine
+    # category that drives ranking, severity and the habit rollup.
+    if coach_advice:
+        by_n = {int(d.get("n", -1)): d for d in (coach_advice.get("deaths") or [])}
+        for d in deaths:
+            entry = by_n.get(d["idx"] + 1) or {}
+            d["aiAdvice"] = entry.get("advice")
+            if entry.get("title"):
+                d["title"] = entry["title"]
+
     return {
         "matchId": match.match_id,
+        "habit": habit,
+        "kits": kits,
+        "damage": _damage_profile(me, match, ab_meta, item, hmeta),
+        "coach": coach_advice,
         "hero": {"name": my_name, "icon": my_icon, "heroId": me.hero_id,
                  "side": "Radiant" if me.is_radiant else "Dire",
                  "isRadiant": me.is_radiant, "won": won},
         "scoreboard": scoreboard,
         "visionR": round(vision_px, 1),
+        "towerVisionR": round(
+            TOWER_VISION_UNITS / WORLD_PER_GRID / (C.GAME_MAX - C.GAME_MIN) * M, 1),
         "buildings": [{"key": b.key, "x": P(b.x, b.y)[0], "y": P(b.x, b.y)[1],
-                       "icon": b.icon, "kind": b.kind} for b in match.buildings],
+                       "icon": b.icon, "kind": b.kind,
+                       "isRadiant": b.is_radiant} for b in match.buildings],
         "summary": {
             "deathCount": len(deaths),
             "totalGoldLost": total_gold,
@@ -794,10 +1198,11 @@ def build_report(match: MatchData, me: HeroTrack, analyses: list[DeathAnalysis])
 
 
 def render(match: MatchData, me: HeroTrack, analyses: list[DeathAnalysis],
-           out_path: str) -> str:
-    report = build_report(match, me, analyses)
+           out_path: str, coach_advice: dict | None = None) -> str:
+    report = build_report(match, me, analyses, coach_advice)
     sprites = {b.icon: _b64(b.icon) for b in match.buildings}
-    for ward_icon in ("ward_observer.png", "ward_sentry.png"):
+    for ward_icon in ("ward_observer_ally.png", "ward_observer_enemy.png",
+                      "ward_sentry_ally.png", "ward_sentry_enemy.png"):
         try:
             sprites[ward_icon] = _b64(ward_icon)
         except Exception:
@@ -827,292 +1232,514 @@ _TEMPLATE = r"""<!doctype html>
 <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700&family=Source+Sans+3:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
 :root{
-  --bg:#0a0e1a; --bg-elev:#111827; --bg-soft:#1a2235;
-  --line:#2a3548; --line-soft:#1c2536;
-  --text:#f1f5f9; --muted:#94a3b8; --faint:#64748b;
+  --bg:#070b14; --bg-elev:#0e1524; --bg-soft:#151d2e; --bg-lift:#1b2437;
+  --line:#25314a; --line-soft:#1a2336;
+  --text:#eef2f9; --muted:#9aa8bf; --faint:#697990;
   --you:#fbbf24; --radiant:#4ade80; --dire:#f87171;
-  --ward:#e0b83a; --eward:#b56fd4; --accent:#fbbf24;
+  --ward:#e0b83a; --eward:#b56fd4;
+  --accent:#a78bfa; --accent-dim:rgba(167,139,250,.14);
   --ok:#4ade80; --warn:#fbbf24; --bad:#f87171; --fight:#60a5fa;
+  --r-sm:8px; --r:12px; --r-lg:18px;
   --font-display:"Outfit",system-ui,sans-serif;
   --font-body:"Source Sans 3",system-ui,sans-serif;
+  --shadow:0 1px 2px rgba(0,0,0,.4), 0 8px 28px rgba(0,0,0,.28);
 }
 *{box-sizing:border-box}
-html,body{height:100%;margin:0}
+html{scroll-behavior:smooth}
+html,body{margin:0}
 body{
-  font-family:var(--font-body);
+  font-family:var(--font-body);font-size:15px;line-height:1.6;
   background:
-    radial-gradient(1100px 640px at 8% -8%, #152038 0%, transparent 55%),
-    radial-gradient(900px 560px at 100% 0%, #1a1620 0%, transparent 48%),
+    radial-gradient(1200px 700px at 12% -10%, #16223c 0%, transparent 55%),
+    radial-gradient(1000px 600px at 100% 2%, #1d1726 0%, transparent 50%),
     var(--bg);
-  color:var(--text); overflow:hidden;
+  background-attachment:fixed;
+  color:var(--text);-webkit-font-smoothing:antialiased;
 }
 button{font:inherit;color:inherit;background:none;border:0;cursor:pointer;padding:0}
-.app{display:flex;flex-direction:column;height:100vh;min-height:0}
+h1,h2,h3{font-family:var(--font-display);margin:0;line-height:1.25}
+img{max-width:100%}
+.wrap{max-width:1560px;margin:0 auto;padding:0 24px 72px}
 
-.board{
-  display:grid;grid-template-columns:1fr auto 1fr;align-items:center;gap:16px;
-  padding:10px 18px;border-bottom:1px solid var(--line-soft);
-  background:rgba(10,13,18,.8);backdrop-filter:blur(10px);flex:0 0 auto;
+/* ---------- section furniture ---------- */
+.sec{margin:36px 0 0}
+.sec-head{display:flex;align-items:baseline;gap:12px;margin:0 0 14px}
+.sec-head h2{font-size:19px;font-weight:650;letter-spacing:-.01em}
+.sec-head .hint{font-size:13px;color:var(--faint)}
+.eyebrow{font-size:10.5px;font-weight:700;letter-spacing:.16em;text-transform:uppercase;
+  color:var(--accent);margin:0 0 8px}
+.card{background:var(--bg-elev);border:1px solid var(--line-soft);border-radius:var(--r-lg);
+  box-shadow:var(--shadow)}
+
+/* ---------- header ---------- */
+.hero-head{
+  border-bottom:1px solid var(--line-soft);
+  background:linear-gradient(180deg, rgba(14,21,36,.92), rgba(7,11,20,.75));
+  backdrop-filter:blur(12px);position:sticky;top:0;z-index:30;
 }
-.team{display:flex;gap:8px;align-items:center}
+.hh-in{max-width:1560px;margin:0 auto;padding:12px 24px;
+  display:flex;align-items:center;gap:18px;flex-wrap:wrap}
+.hh-id{display:flex;align-items:center;gap:13px;min-width:0}
+.hh-por{width:54px;height:54px;border-radius:13px;object-fit:cover;flex:0 0 auto;
+  border:2px solid var(--line);box-shadow:0 4px 14px rgba(0,0,0,.5)}
+.hh-name{font-family:var(--font-display);font-size:20px;font-weight:650;letter-spacing:-.01em;
+  display:flex;align-items:center;gap:9px;flex-wrap:wrap}
+.hh-sub{font-size:12.5px;color:var(--faint)}
+.badge{font-size:10.5px;font-weight:700;letter-spacing:.09em;text-transform:uppercase;
+  padding:3px 9px;border-radius:999px;border:1px solid transparent}
+.badge.win{color:#86efac;background:rgba(74,222,128,.13);border-color:rgba(74,222,128,.32)}
+.badge.loss{color:#fca5a5;background:rgba(248,113,113,.13);border-color:rgba(248,113,113,.32)}
+.hh-stats{display:flex;gap:22px;margin-left:auto;flex-wrap:wrap}
+.hh-stat{text-align:right}
+.hh-stat b{display:block;font-family:var(--font-display);font-size:18px;font-weight:650;
+  letter-spacing:-.01em;line-height:1.2}
+.hh-stat span{font-size:10.5px;color:var(--faint);text-transform:uppercase;letter-spacing:.1em}
+.hh-draft{display:flex;gap:14px;align-items:center;width:100%;padding-top:2px}
+.team{display:flex;gap:5px;align-items:center}
 .team.radiant{justify-content:flex-end}
-.team.dire{justify-content:flex-start}
-.slot{
-  position:relative;width:52px;height:52px;border-radius:10px;overflow:hidden;
-  background:#0d1219;border:2px solid transparent;opacity:.92;
-}
+.vs{font-size:11px;color:var(--faint);font-weight:700;letter-spacing:.1em}
+.slot{position:relative;width:38px;height:38px;border-radius:9px;overflow:hidden;
+  background:#0d1219;border:2px solid transparent;opacity:.86;transition:.15s}
 .slot img{width:100%;height:100%;object-fit:cover;display:block}
-.slot.radiant{border-color:var(--radiant)}
-.slot.dire{border-color:var(--dire)}
-.slot.me{box-shadow:0 0 0 2px var(--you);border-color:var(--you)}
-.slot.dead{opacity:.28;filter:grayscale(.8)}
-.slot.killer::after{
-  content:"";position:absolute;inset:0;border:2px dashed rgba(239,91,91,.85);border-radius:6px;pointer-events:none;
-}
-.mid{text-align:center;min-width:180px}
-.mid .brand{font-family:var(--font-display);font-weight:700;font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:var(--muted)}
-.mid .brand em{color:var(--accent);font-style:normal}
-.mid .meta{font-size:12px;color:var(--faint);margin-top:2px}
-.badge{display:inline-flex;font-size:10px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;padding:3px 8px;border-radius:999px;border:1px solid transparent;margin-left:6px}
-.badge.win{color:var(--ok);background:rgba(74,222,128,.12);border-color:rgba(74,222,128,.28)}
-.badge.loss{color:var(--bad);background:rgba(248,113,113,.12);border-color:rgba(248,113,113,.28)}
+.slot.radiant{border-color:rgba(74,222,128,.4)}
+.slot.dire{border-color:rgba(248,113,113,.4)}
+.slot.me{border-color:var(--you);opacity:1;box-shadow:0 0 0 2px rgba(251,191,36,.22)}
 
-.main{display:flex;flex:1;min-height:0}
-.rail{width:280px;flex:0 0 auto;display:flex;flex-direction:column;min-height:0;border-right:1px solid var(--line-soft);background:rgba(17,24,39,.7)}
-.rail-head{padding:16px 16px 12px;border-bottom:1px solid var(--line-soft)}
-.rail-head h2{margin:0 0 12px;font-family:var(--font-display);font-size:10px;font-weight:700;letter-spacing:.15em;text-transform:uppercase;color:var(--accent)}
-.sort{display:grid;grid-template-columns:1fr 1fr;gap:8px}
-.sort button{padding:8px 8px;border-radius:8px;font-size:12px;font-weight:600;color:var(--muted);background:var(--bg-soft);border:1px solid var(--line-soft)}
-.sort button.on{color:var(--text);border-color:#3a4d66;background:#1a2330}
-#deathlist{flex:1;overflow-y:auto;padding:12px}
-.drow{display:grid;grid-template-columns:auto 1fr auto;gap:12px;align-items:start;padding:14px;border-radius:14px;cursor:pointer;margin-bottom:10px;border:1px solid transparent;border-left:3px solid transparent}
-.drow:hover{background:rgba(255,255,255,.03)}
-.drow.on{background:#182231;border-color:#334860;border-left-color:var(--accent)}
-.drow .dot{width:10px;height:10px;border-radius:50%;margin-top:5px}
-.drow .dot.critical{background:var(--bad)}
-.drow .dot.notable{background:var(--warn)}
-.drow .dot.fight{background:var(--fight)}
-.drow .dot.normal{background:#4a586a}
-.drow .clock{font-family:var(--font-display);font-weight:650;font-size:15px}
-.drow .title{font-size:13px;color:#c5d0dc;margin-top:2px;line-height:1.3}
-.drow .sev{font-size:11px;color:var(--faint);margin-top:4px;text-transform:uppercase;letter-spacing:.05em}
-.drow .num{font-size:11px;color:var(--faint);font-weight:600;background:var(--bg);border:1px solid var(--line-soft);border-radius:6px;padding:2px 6px}
+/* ---------- verdict ---------- */
+.verdict{position:relative;overflow:hidden;padding:26px 30px;margin-top:28px;
+  border-radius:var(--r-lg);border:1px solid rgba(167,139,250,.26);
+  background:
+    radial-gradient(760px 260px at 0% 0%, rgba(167,139,250,.14), transparent 62%),
+    var(--bg-elev);
+  box-shadow:var(--shadow)}
+.verdict::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;
+  background:linear-gradient(180deg,var(--accent),rgba(167,139,250,.15))}
+.verdict h1{font-size:26px;font-weight:650;letter-spacing:-.02em;max-width:44ch;margin:0 0 10px}
+.verdict .fix{font-size:15.5px;color:var(--muted);max-width:78ch;margin:0}
+.verdict .drill{display:inline-flex;align-items:flex-start;gap:9px;margin:18px 0 0;
+  padding:11px 15px;border-radius:var(--r);background:rgba(167,139,250,.1);
+  border:1px solid rgba(167,139,250,.22);font-size:14px;color:#e9e2ff;max-width:72ch}
+.verdict .drill b{color:var(--accent);white-space:nowrap;font-weight:650}
+.overall{font-size:15.5px;color:var(--muted);max-width:82ch;margin:16px 0 0}
 
-.mapwrap{flex:1;min-width:0;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:12px 16px;gap:10px}
-.map-stage{position:relative;flex:1;min-height:0;aspect-ratio:1/1;max-width:100%;max-height:calc(100vh - 210px)}
-svg{width:100%;height:100%;border-radius:16px;border:1px solid var(--line);background:#05070b}
-.map-toggle{position:absolute;right:12px;top:12px;font-size:11px;font-weight:600;color:#d5deea;background:rgba(8,11,16,.78);border:1px solid rgba(255,255,255,.14);border-radius:999px;padding:6px 12px;cursor:pointer}
-.map-toggle:hover{border-color:rgba(255,255,255,.32);color:#fff}
+/* ---------- strengths / mistakes ---------- */
+.cols{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:18px}
+.colcard{padding:20px 22px}
+.colcard > h3{font-size:13px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;
+  display:flex;align-items:center;gap:8px;margin:0 0 14px}
+.colcard.good > h3{color:var(--ok)}
+.colcard.bad > h3{color:var(--bad)}
+.colcard > h3 .ic{width:20px;height:20px;border-radius:6px;display:grid;place-items:center;
+  font-size:12px;font-weight:700}
+.colcard.good .ic{background:rgba(74,222,128,.15)}
+.colcard.bad .ic{background:rgba(248,113,113,.15)}
+.pt{padding:13px 0;border-top:1px solid var(--line-soft)}
+.pt:first-of-type{border-top:0;padding-top:0}
+.pt .ptt{font-size:14.5px;font-weight:650;margin:0 0 4px;font-family:var(--font-display)}
+.pt .ptx{font-size:14px;color:var(--muted);margin:0}
+.itemcard{padding:20px 22px}
+.itemcard p{margin:0;font-size:14.5px;color:var(--muted);max-width:84ch}
 
-.transport{
-  width:min(100%,640px);display:grid;grid-template-columns:auto 1fr auto;gap:12px;align-items:center;
-  padding:10px 12px;border-radius:12px;background:rgba(16,21,29,.85);border:1px solid var(--line-soft);
-}
-.transport .play{
-  width:40px;height:40px;border-radius:10px;border:1px solid var(--line);background:var(--bg-elev);
-  font-size:16px;display:flex;align-items:center;justify-content:center;
-}
-.transport .play:hover{border-color:#3d516b}
-.scrub{display:flex;flex-direction:column;gap:4px;min-width:0}
-.scrub input[type=range]{width:100%;accent-color:var(--you)}
-.scrub .times{display:flex;justify-content:space-between;font-size:11px;color:var(--faint);font-family:var(--font-display)}
-.scrub .times strong{color:var(--text);font-weight:650}
+/* ---------- habit banner ---------- */
+.habit{display:flex;align-items:center;gap:14px;padding:14px 20px;margin-top:18px;
+  border-radius:var(--r);border:1px solid var(--line-soft);background:var(--bg-soft);
+  font-size:14px;color:var(--muted)}
+.habit b{color:var(--text);font-weight:650}
+.habit .nem{display:inline-flex;align-items:center;gap:7px}
+.habit .nem img{width:26px;height:26px;border-radius:7px;object-fit:cover}
+
+/* ---------- death strip ---------- */
+.strip-head{display:flex;align-items:center;gap:14px;margin:0 0 12px;flex-wrap:wrap}
+.sort{display:flex;gap:3px;margin-left:auto;background:var(--bg-soft);padding:3px;
+  border-radius:999px;border:1px solid var(--line-soft)}
+.sort button{font-size:12px;padding:5px 13px;border-radius:999px;color:var(--faint);
+  font-weight:600;transition:.15s}
+.sort button:hover{color:var(--muted)}
+.sort button.on{background:var(--bg-lift);color:var(--text)}
+.strip{display:flex;gap:10px;overflow-x:auto;padding:4px 2px 12px;scrollbar-width:thin}
+.strip::-webkit-scrollbar{height:7px}
+.strip::-webkit-scrollbar-thumb{background:var(--line);border-radius:99px}
+.dcard{flex:0 0 auto;width:186px;text-align:left;padding:12px 14px;border-radius:var(--r);
+  background:var(--bg-elev);border:1px solid var(--line-soft);transition:.15s;position:relative}
+.dcard:hover{border-color:var(--line);transform:translateY(-1px)}
+.dcard.on{border-color:var(--accent);background:linear-gradient(180deg,var(--accent-dim),var(--bg-elev));
+  box-shadow:0 0 0 1px rgba(167,139,250,.25)}
+.dcard .row1{display:flex;align-items:center;gap:7px;margin-bottom:5px}
+.dcard .dot{width:7px;height:7px;border-radius:50%;flex:0 0 auto}
+.dot.critical{background:var(--bad)} .dot.notable{background:var(--warn)}
+.dot.minor{background:var(--faint)} .dot.fight{background:var(--fight)}
+.dcard .clock{font-family:var(--font-display);font-size:14px;font-weight:650}
+.dcard .num{margin-left:auto;font-size:11px;color:var(--faint)}
+.dcard .title{font-size:13px;color:var(--muted);line-height:1.4;
+  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.dcard .flag{display:inline-block;margin-top:7px;font-size:9.5px;font-weight:700;
+  letter-spacing:.09em;text-transform:uppercase;color:var(--accent);
+  background:var(--accent-dim);padding:2px 7px;border-radius:999px}
+
+/* ---------- stage: teams flank the map ---------- */
+.stage{display:grid;grid-template-columns:216px minmax(0,1fr) 216px;gap:18px;align-items:start}
+.team-col{display:flex;flex-direction:column;gap:7px;min-width:0}
+.team-col h3{font-size:11px;font-weight:700;letter-spacing:.13em;text-transform:uppercase;
+  padding:0 2px 2px}
+.srow{min-width:0;padding:9px 10px;border-radius:var(--r);background:var(--bg-elev);
+  border:1px solid var(--line-soft);transition:.15s}
+.srow.dead{opacity:.42}
+.srow.me{border-color:rgba(251,191,36,.45);background:linear-gradient(180deg,rgba(251,191,36,.09),var(--bg-elev))}
+.hd{display:grid;grid-template-columns:26px minmax(0,1fr) auto;gap:8px;align-items:center}
+.hd > div{min-width:0}
+.hd .hp{width:26px;height:26px;border-radius:7px;object-fit:cover}
+.nm{font-size:12.5px;font-weight:650;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+  display:flex;align-items:center;gap:5px}
+.po{flex:0 0 auto;min-width:14px;padding:1px 4px;border-radius:4px;
+  background:rgba(154,168,191,.16);color:var(--faint);font-size:9.5px;font-weight:700;
+  text-align:center}
+.srow.me .po{background:rgba(251,191,36,.24);color:var(--you)}
+.kda{font-size:11px;color:var(--faint);font-variant-numeric:tabular-nums}
+.lvl{font-size:10.5px;font-weight:700;color:var(--muted);background:var(--bg-lift);
+  padding:2px 6px;border-radius:5px}
+.abs{display:flex;gap:3px;margin:7px 0 0}
+.ab{position:relative;width:23px;height:23px;border-radius:5px;overflow:hidden;
+  background:#0a1120;border:1px solid var(--line-soft);flex:0 0 auto}
+.ab img{width:100%;height:100%;object-fit:cover;display:block}
+.ab.cool img{filter:grayscale(1) brightness(.42)}
+.ab.locked{opacity:.28}
+.ab.locked img{filter:grayscale(1) brightness(.5)}
+.ab i{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+  font-style:normal;font-size:10px;font-weight:700;color:#fff;text-shadow:0 1px 3px #000}
+.bars{display:flex;flex-direction:column;gap:3px;margin:7px 0 0}
+.sbar{height:4px;border-radius:99px;background:rgba(0,0,0,.45);overflow:hidden}
+.sbar i{display:block;height:100%;border-radius:99px;transition:width .12s linear}
+.num{display:flex;justify-content:space-between;font-size:10.5px;color:var(--faint);
+  margin:6px 0 0;font-variant-numeric:tabular-nums}
+.its{display:grid;grid-template-columns:repeat(6,1fr);gap:3px;margin:7px 0 0}
+.its img,.its .sl{width:100%;aspect-ratio:1.35/1;border-radius:4px;object-fit:cover;display:block}
+.its .sl{background:rgba(0,0,0,.32);border:1px solid var(--line-soft)}
+.st{display:flex;flex-wrap:wrap;gap:4px;margin:7px 0 0;font-size:10px;font-weight:600}
+
+/* ---------- map ---------- */
+.mapwrap{display:flex;flex-direction:column;align-items:center;gap:12px;min-width:0}
+.map-stage{position:relative;width:100%;max-width:760px;aspect-ratio:1/1}
+#map{width:100%;height:100%;display:block;border-radius:var(--r-lg);
+  border:1px solid var(--line);background:#080c14;box-shadow:var(--shadow)}
+.map-toggle{position:absolute;top:11px;right:11px;font-size:11px;font-weight:600;
+  padding:6px 11px;border-radius:999px;background:rgba(7,11,20,.82);color:var(--muted);
+  border:1px solid var(--line);backdrop-filter:blur(6px);transition:.15s}
+.map-toggle:hover{color:var(--text);border-color:var(--accent)}
+.transport{display:flex;align-items:center;gap:16px;width:100%;max-width:760px;
+  padding:12px 16px;border-radius:var(--r);background:var(--bg-elev);
+  border:1px solid var(--line-soft)}
+.play{width:38px;height:38px;border-radius:50%;flex:0 0 auto;display:grid;place-items:center;
+  background:var(--accent);color:#1a1030;font-size:14px;transition:.15s}
+.play:hover{filter:brightness(1.12)}
+.scrub{flex:1;min-width:0}
+.scrub input{width:100%;accent-color:var(--accent);cursor:pointer}
+.times{display:flex;justify-content:space-between;font-size:11px;color:var(--faint);
+  margin-top:3px;font-variant-numeric:tabular-nums}
+.times strong{color:var(--text);font-weight:650}
 .nav-death{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--muted)}
-.nav-death button{width:30px;height:30px;border-radius:8px;border:1px solid var(--line);background:var(--bg-elev);font-size:15px}
-.nav-death button:disabled{opacity:.35;cursor:default}
-.kbd{display:inline-block;font-size:10px;border:1px solid var(--line);border-radius:4px;padding:1px 5px;color:var(--muted)}
+.nav-death button{width:28px;height:28px;border-radius:8px;background:var(--bg-lift);
+  display:grid;place-items:center;transition:.15s}
+.nav-death button:hover{background:var(--line);color:var(--text)}
+.kbd{font-size:10px;color:var(--faint);border:1px solid var(--line);
+  padding:2px 6px;border-radius:5px}
 
-.panel{width:420px;flex:0 0 auto;overflow-y:auto;min-height:0;border-left:1px solid var(--line-soft);background:rgba(16,21,29,.78);padding:22px 22px 36px}
-.sev-tag{display:inline-flex;font-size:11px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;padding:5px 10px;border-radius:8px;border:1px solid transparent}
-.sev-tag.critical{color:#ffb0b0;background:rgba(239,91,91,.12);border-color:rgba(239,91,91,.3)}
-.sev-tag.notable{color:#ffd39a;background:rgba(224,162,58,.12);border-color:rgba(224,162,58,.3)}
-.sev-tag.fight{color:#b7d3ff;background:rgba(110,168,255,.12);border-color:rgba(110,168,255,.3)}
-.sev-tag.normal{color:#b7c2d0;background:rgba(255,255,255,.04);border-color:var(--line)}
-.panel h1{font-family:var(--font-display);font-size:22px;font-weight:700;margin:14px 0 8px;line-height:1.2}
-.panel .blurb{color:var(--muted);font-size:14.5px;line-height:1.5;margin:0 0 18px}
-.lesson{
-  margin:0 0 20px;padding:16px 16px;border-radius:14px;
-  border:1px solid rgba(251,191,36,.35);background:rgba(251,191,36,.06);
-}
-.lesson .k{display:block;font-size:10px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;color:var(--accent);margin-bottom:8px}
-.lesson .t{font-size:14px;font-weight:650;color:var(--text);line-height:1.45;margin:0 0 8px}
-.lesson .s{font-size:12px;color:var(--muted);line-height:1.45;margin:0}
-.story,.situation{margin:0 0 18px;padding:14px 16px;border-radius:12px;font-size:13.5px;line-height:1.5}
-.story{background:rgba(96,165,250,.08);border:1px solid rgba(96,165,250,.22);color:#cfe0ff;border-left:3px solid var(--fight)}
-.situation{background:var(--bg-soft);border:1px solid var(--line-soft);color:#c5d0dc}
-.story .k{display:block;font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;margin-bottom:6px;color:var(--fight)}
-.section{margin:0 0 24px;padding-bottom:4px}
-.section h3{margin:0 0 12px;font-family:var(--font-display);font-size:10px;font-weight:700;letter-spacing:.15em;text-transform:uppercase;color:var(--accent)}
-.chips{display:flex;flex-wrap:wrap;gap:8px}
-.chip{font-size:12.5px;font-weight:600;color:#d5deea;background:var(--bg-soft);border:1px solid var(--line);border-radius:999px;padding:6px 11px}
-.kb{display:flex;align-items:center;gap:10px;font-size:14px;color:#c5d0dc;padding:12px 14px;border-radius:12px;background:var(--bg-soft);border:1px solid var(--line-soft)}
-.kb img{width:28px;height:28px;border-radius:50%;border:1.5px solid var(--dire)}
-.meters{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-.meter{padding:12px 14px;border-radius:12px;background:var(--bg-soft);border:1px solid var(--line-soft)}
-.meter .lbl{font-size:11px;color:var(--faint);text-transform:uppercase;letter-spacing:.06em}
-.meter .val{font-family:var(--font-display);font-weight:650;font-size:15px;margin-top:2px}
-.bar{height:6px;border-radius:3px;background:#232b36;margin-top:8px;overflow:hidden}
-.bar i{display:block;height:100%;border-radius:3px}
-.lvl{display:flex;align-items:center;justify-content:center;font-family:var(--font-display);font-weight:700;font-size:18px;border-radius:12px;background:var(--bg-soft);border:1px solid var(--line-soft)}
-.findings{display:flex;flex-direction:column;gap:10px}
-.finding{display:grid;grid-template-columns:1fr;gap:5px;padding:14px 14px;border-radius:12px;background:var(--bg-elev);border:1px solid var(--line-soft);border-left:3px solid var(--line)}
-.finding.bad{border-left-color:var(--bad)}
-.finding.warn{border-left-color:var(--warn)}
-.finding.ok{border-left-color:var(--ok)}
-.finding .ft{font-weight:650;font-size:13px}
-.finding .fx{font-size:13px;color:var(--muted);line-height:1.45}
-.statuses{display:flex;flex-wrap:wrap;gap:8px}
-.stchip{
-  display:inline-flex;align-items:center;gap:6px;font-size:11.5px;font-weight:700;
-  letter-spacing:.04em;text-transform:uppercase;padding:6px 10px;border-radius:999px;
-  border:1px solid currentColor;background:rgba(0,0,0,.25);
-}
-.stchip.good{background:rgba(74,222,128,.08)}
-.stchip.bad{background:rgba(248,113,113,.06)}
-.stchip .src{font-weight:500;text-transform:none;letter-spacing:0;color:var(--muted);font-size:11px}
-.next{
-  margin:8px 0 20px;padding:16px 16px;border-radius:14px;
-  border:1px solid var(--line);background:var(--bg-elev);
-}
-.next .k{display:block;font-size:10px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;color:var(--accent);margin-bottom:10px}
-.next ol{margin:0;padding:0;list-style:none;display:flex;flex-direction:column;gap:10px}
-.next li{display:flex;gap:10px;align-items:flex-start;font-size:13.5px;line-height:1.4;color:#d5deea}
-.next .n{
-  flex:0 0 auto;width:24px;height:24px;border-radius:50%;
-  display:flex;align-items:center;justify-content:center;
-  font-family:var(--font-display);font-size:12px;font-weight:700;
-  color:var(--accent);background:rgba(251,191,36,.12);border:1px solid rgba(251,191,36,.28);
-}
-.tchip{
-  display:inline-flex;align-items:center;gap:5px;font-size:11.5px;font-weight:600;
-  color:#d5deea;background:var(--bg-elev);border:1px solid var(--line);border-radius:999px;padding:3px 8px 3px 3px;
-}
-.tchip img{width:18px;height:18px;border-radius:4px;background:#0d1219}
-.tchip .tm{
-  font-family:var(--font-display);font-size:10px;font-weight:700;letter-spacing:.04em;
-  color:var(--accent);background:rgba(251,191,36,.12);border:1px solid rgba(251,191,36,.25);
-  border-radius:999px;padding:2px 6px;
-}
-.tchip.ult{border-color:rgba(251,191,36,.45);background:rgba(251,191,36,.07)}
-.tchip .who{color:var(--faint);font-weight:500;font-size:10.5px}
-.roster{display:flex;flex-direction:column;gap:8px}
-.rrow{display:grid;grid-template-columns:30px 1fr auto;gap:12px;align-items:center;padding:10px 12px;border-radius:12px;background:var(--bg-soft);border:1px solid var(--line-soft)}
-.rrow img{width:30px;height:30px;border-radius:50%;border:2px solid #445}
-.rrow.radiant img{border-color:var(--radiant)}
-.rrow.dire img{border-color:var(--dire)}
-.rrow.me img{border-color:var(--you)}
-.rrow .rn{font-weight:650;font-size:13px}
-.rrow .rm{font-size:11.5px;color:var(--faint);margin-top:1px}
-.rrow .rd{font-family:var(--font-display);font-size:12px;font-weight:650;color:var(--muted);text-align:right}
-.rrow .tagkill{display:inline-block;margin-left:6px;font-size:10px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;color:#ffb0b0}
-.eload{display:flex;flex-direction:column;gap:10px}
-.erow{padding:12px 14px;border-radius:12px;background:var(--bg-soft);border:1px solid var(--line-soft)}
-.erow .etop{display:flex;align-items:center;gap:8px;margin-bottom:8px}
-.erow img.hero{width:28px;height:28px;border-radius:50%;border:2px solid var(--dire)}
-.erow.ally img.hero{border-color:var(--radiant)}
-.erow .ename{font-weight:650;font-size:13px}
-.erow .eflags{font-size:11px;color:var(--warn);margin-left:auto}
-.erow .eitems,.items{display:flex;flex-wrap:wrap;gap:5px;align-items:center}
-.erow .eitems img,.items img{
-  width:42px;height:32px;border-radius:5px;background:#0d1219;border:1px solid var(--line);
-  object-fit:cover;display:block;
-}
-.items img.neu{outline:1px solid var(--accent);outline-offset:1px}
-.erow .eitems .ph,.items .ph{
-  width:42px;height:32px;border-radius:5px;background:#0d1219;border:1px solid var(--line);
-  font-size:8px;color:var(--faint);display:flex;align-items:center;justify-content:center;text-align:center;padding:2px;
-}
-.ults{display:flex;flex-direction:column;gap:8px}
-.ult{
-  display:grid;grid-template-columns:28px 1fr auto;gap:10px;align-items:center;
-  padding:10px 12px;border-radius:12px;background:var(--bg-soft);border:1px solid var(--line-soft);
-}
-.ult img{width:28px;height:28px;border-radius:6px;background:#0d1219}
-.ult .un{font-weight:650;font-size:13px}
-.ult .ux{font-size:12px;color:#aeb9c7;margin-top:2px;line-height:1.35}
-.ult .ustate{font-size:11px;font-weight:700;letter-spacing:.04em;text-transform:uppercase}
-.ult .ustate.ready{color:var(--ok)}
-.ult .ustate.cooldown{color:var(--warn)}
-.ult .ustate.unskilled,.ult .ustate.unknown{color:var(--faint)}
-.casts{display:flex;flex-wrap:wrap;gap:5px}
-.crow{
-  display:none;
-}
-details.sec{margin:0 0 14px;border:1px solid var(--line-soft);border-radius:12px;background:rgba(255,255,255,.015)}
-details.sec summary{cursor:pointer;padding:12px 14px;font-family:var(--font-display);font-size:10px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);list-style:none;display:flex;align-items:center;justify-content:space-between;gap:8px}
-details.sec summary::-webkit-details-marker{display:none}
-details.sec summary::after{content:"+";color:var(--faint);font-size:14px;font-weight:600}
-details.sec[open] summary::after{content:"\2212"}
-details.sec summary:hover{color:var(--text)}
-details.sec .inner{padding:2px 14px 14px}
-.subh{font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--faint);margin:14px 0 8px}
-.subh:first-child{margin-top:0}
-.leg{font-size:12px;color:var(--faint);line-height:1.7;border-top:1px solid var(--line-soft);padding-top:12px}
-.sw{display:inline-block;width:9px;height:9px;border-radius:50%;margin:0 4px 0 8px;vertical-align:0}
-.sw:first-child{margin-left:0}
-.hint{font-size:11.5px;color:var(--faint);margin-top:6px}
+/* ---------- detail panel ---------- */
+/* Full width now, so the detail blocks tile instead of forming one long
+   column with a thousand pixels of dead space beside it. */
+.panel{margin-top:20px;padding:24px 26px;
+  display:grid;grid-template-columns:repeat(auto-fit,minmax(330px,1fr));
+  gap:18px;align-items:start}
+.panel > .sev-tag,.panel > h1,.panel > .blurb,.panel > .chips,
+.panel > details,.panel > .leg{grid-column:1/-1;margin:0}
+.panel > .sev-tag{justify-self:start}
+.panel > h1,.panel > .blurb{max-width:70ch}
+.panel > .diag,.panel > .coach,.panel > .lesson,.panel > .story,
+.panel > .section,.panel > .next{margin:0;align-self:start}
+.panel > details > .inner,.panel > details > div{margin-top:10px}
+.sev-tag{display:inline-block;font-size:10px;font-weight:700;letter-spacing:.11em;
+  text-transform:uppercase;padding:4px 10px;border-radius:999px;margin-bottom:11px}
+.sev-tag.critical{color:#fca5a5;background:rgba(248,113,113,.14)}
+.sev-tag.notable{color:#fcd34d;background:rgba(251,191,36,.14)}
+.sev-tag.minor{color:var(--muted);background:rgba(154,168,191,.12)}
+.sev-tag.fight{color:#93c5fd;background:rgba(96,165,250,.14)}
+.panel h1{font-size:23px;font-weight:650;letter-spacing:-.015em;margin:0 0 8px;max-width:40ch}
+.panel .blurb{font-size:14.5px;color:var(--muted);margin:0 0 18px;max-width:80ch}
+.pgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:20px}
+.chips{display:flex;flex-wrap:wrap;gap:7px}
+.chip{font-size:12px;padding:5px 11px;border-radius:999px;background:var(--bg-soft);
+  border:1px solid var(--line-soft);color:var(--muted)}
+.subh{font-size:11px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;
+  color:var(--faint);margin:0 0 10px}
+.coach{padding:16px 18px;border-radius:var(--r);margin:0 0 18px;
+  background:rgba(167,139,250,.08);border:1px solid rgba(167,139,250,.2)}
+.coach .k{display:block;font-size:10px;font-weight:700;letter-spacing:.14em;
+  text-transform:uppercase;color:var(--accent);margin-bottom:7px}
+.coach .t{font-size:14.5px;font-weight:650;margin:0 0 7px;line-height:1.45}
+.coach .x{font-size:14px;color:var(--muted);line-height:1.55;margin:0}
+.diag{padding:14px 16px;border-radius:var(--r);margin:0 0 18px;background:var(--bg-soft);
+  border-left:3px solid var(--line)}
+.diag.awareness{border-left-color:var(--warn)}
+.diag.execution{border-left-color:var(--bad)}
+.diag.committed{border-left-color:var(--fight)}
+.diag .k{display:block;font-size:10px;font-weight:700;letter-spacing:.13em;
+  text-transform:uppercase;color:var(--faint);margin-bottom:6px}
+.diag .t{font-size:14.5px;font-weight:650;margin:0 0 6px}
+.diag .x{font-size:14px;color:var(--muted);margin:0}
+.finding{padding:11px 0;border-top:1px solid var(--line-soft)}
+.finding:first-of-type{border-top:0;padding-top:0}
+.finding .ft{font-size:14px;font-weight:650;margin-bottom:3px}
+.finding .fx{font-size:13.5px;color:var(--muted)}
+.finding.ok .ft{color:var(--ok)} .finding.bad .ft{color:var(--bad)}
+.statuses{display:flex;flex-wrap:wrap;gap:6px}
+.stchip{display:inline-flex;align-items:baseline;gap:6px;font-size:11.5px;font-weight:650;
+  padding:4px 10px;border-radius:999px;background:var(--bg-soft);border:1px solid var(--line-soft)}
+.stchip .src{font-weight:500;text-transform:none;letter-spacing:0;color:var(--faint);font-size:10.5px}
+.focus{margin:18px 0 0;padding:0;list-style:none}
+.focus li{display:flex;gap:11px;align-items:flex-start;padding:9px 0;font-size:14px;
+  border-top:1px solid var(--line-soft)}
+.focus li:first-child{border-top:0}
+.focus .n{flex:0 0 auto;width:20px;height:20px;border-radius:50%;background:var(--accent-dim);
+  color:var(--accent);font-size:11px;font-weight:700;display:grid;place-items:center;margin-top:2px}
 
-@media (max-width:980px){
-  .panel{width:360px}.rail{width:240px}
-  .board{grid-template-columns:1fr;justify-items:center}
-  .team{justify-content:center !important}
+/* ---------- upgrade badges ---------- */
+.upg{width:23px;height:23px;border-radius:5px;display:grid;place-items:center;flex:0 0 auto;
+  font-size:11px;font-weight:800;font-family:var(--font-display)}
+.upg.ag{background:rgba(96,165,250,.2);color:#93c5fd;border:1px solid rgba(96,165,250,.45)}
+.upg.sh{background:rgba(167,139,250,.2);color:#c4b5fd;border:1px solid rgba(167,139,250,.45)}
+
+/* ---------- panel internals ---------- */
+.panel .section{padding:16px 18px;border-radius:var(--r);background:var(--bg-soft);
+  border:1px solid var(--line-soft)}
+.panel .section > h3{font-size:11px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;
+  color:var(--faint);margin:0 0 12px}
+.lesson,.story{padding:14px 16px;border-radius:var(--r);background:var(--bg-soft);
+  border:1px solid var(--line-soft);font-size:14px;color:var(--muted)}
+.lesson .k,.story .k,.next .k{display:block;font-size:10px;font-weight:700;letter-spacing:.13em;
+  text-transform:uppercase;color:var(--faint);margin-bottom:7px}
+.lesson .t{font-size:14.5px;font-weight:650;color:var(--text);margin:0 0 5px}
+.lesson .s{font-size:12.5px;color:var(--faint);margin:0}
+.hint{font-size:11.5px;color:var(--faint);font-style:italic;margin-top:8px}
+
+.kb{display:flex;align-items:center;gap:11px;font-size:14px;color:var(--muted)}
+.kb img{width:38px;height:38px;border-radius:9px;object-fit:cover;border:2px solid var(--dire)}
+.kb b{color:var(--text);font-weight:650}
+.meters{display:grid;gap:10px}
+.meter{display:grid;grid-template-columns:auto 1fr;gap:2px 10px;align-items:baseline}
+.meter .lbl{font-size:11px;color:var(--faint);text-transform:uppercase;letter-spacing:.08em}
+.meter .val{font-size:12.5px;color:var(--text);text-align:right;font-variant-numeric:tabular-nums}
+.meter .bar{grid-column:1/-1;height:6px;border-radius:99px;background:rgba(0,0,0,.45);overflow:hidden}
+.meter .bar i{display:block;height:100%;border-radius:99px}
+
+.findings{display:grid;gap:0}
+.panel .lvl{display:inline-block;height:auto !important;font-size:11px}
+
+/* collapsibles */
+details.sec{border-radius:var(--r);background:var(--bg-soft);border:1px solid var(--line-soft);
+  overflow:hidden}
+details.sec > summary{cursor:pointer;padding:13px 16px;font-size:13px;font-weight:650;
+  color:var(--muted);list-style:none;display:flex;align-items:center;gap:9px;transition:.15s}
+details.sec > summary::-webkit-details-marker{display:none}
+details.sec > summary::before{content:"›";font-size:16px;color:var(--faint);
+  transition:transform .18s;display:inline-block}
+details.sec[open] > summary{color:var(--text);border-bottom:1px solid var(--line-soft)}
+details.sec[open] > summary::before{transform:rotate(90deg)}
+details.sec > summary:hover{color:var(--text);background:rgba(255,255,255,.02)}
+details.sec .inner{padding:16px}
+
+/* roster */
+.roster{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:8px}
+.rrow{display:grid;grid-template-columns:34px 1fr auto;gap:10px;align-items:center;
+  padding:8px 10px;border-radius:var(--r-sm);background:var(--bg-elev);
+  border:1px solid var(--line-soft);border-left:3px solid var(--line)}
+.rrow.radiant{border-left-color:var(--radiant)}
+.rrow.dire{border-left-color:var(--dire)}
+.rrow.me{border-left-color:var(--you);background:rgba(251,191,36,.07)}
+.rrow img{width:34px;height:34px;border-radius:8px;object-fit:cover}
+.rn{font-size:13px;font-weight:650;display:flex;align-items:center;gap:7px}
+.rm{font-size:11.5px;color:var(--faint)}
+.rd{font-size:11.5px;color:var(--muted);white-space:nowrap;font-variant-numeric:tabular-nums}
+.tagkill{font-size:9px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;
+  color:#fca5a5;background:rgba(248,113,113,.16);padding:2px 6px;border-radius:99px}
+
+/* item rows */
+.items,.eitems{display:flex;flex-wrap:wrap;gap:5px;align-items:center}
+.items img,.eitems img{width:41px;aspect-ratio:1.35/1;border-radius:5px;object-fit:cover;
+  border:1px solid var(--line-soft)}
+.items img{width:48px}
+.ph{font-size:10.5px;color:var(--faint);padding:4px 8px;border-radius:5px;
+  background:var(--bg-soft);border:1px solid var(--line-soft)}
+.neu{border-color:rgba(167,139,250,.5) !important}
+.eload{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:9px;
+  margin-bottom:14px}
+.erow{padding:10px 12px;border-radius:var(--r-sm);background:var(--bg-elev);
+  border:1px solid var(--line-soft);border-left:3px solid var(--dire)}
+.erow.ally{border-left-color:var(--radiant)}
+.etop{display:flex;align-items:center;gap:8px;margin-bottom:8px}
+.etop .hero{width:26px;height:26px;border-radius:7px;object-fit:cover}
+.ename{font-size:12.5px;font-weight:650}
+.eflags{margin-left:auto;font-size:10px;color:var(--warn);font-weight:600}
+
+/* ultimates */
+.ults{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:9px}
+.ult{display:grid;grid-template-columns:34px 1fr auto;gap:10px;align-items:center;
+  padding:9px 11px;border-radius:var(--r-sm);background:var(--bg-elev);
+  border:1px solid var(--line-soft)}
+.ult img{width:34px;height:34px;border-radius:8px;object-fit:cover}
+.un{font-size:12.5px;font-weight:650}
+.ux{font-size:11.5px;color:var(--faint)}
+.ustate{font-size:9.5px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;
+  padding:3px 8px;border-radius:99px;white-space:nowrap}
+.ustate.ready{color:#86efac;background:rgba(74,222,128,.16)}
+.ustate.cooldown{color:#fcd34d;background:rgba(251,191,36,.16)}
+.ustate.unskilled,.ustate.unknown{color:var(--faint);background:rgba(154,168,191,.13)}
+
+/* cast feed */
+.casts{display:flex;flex-wrap:wrap;gap:6px}
+.tchip{display:inline-flex;align-items:center;gap:6px;font-size:11.5px;padding:4px 10px 4px 4px;
+  border-radius:99px;background:var(--bg-elev);border:1px solid var(--line-soft);color:var(--muted)}
+.tchip img{width:20px;height:20px;border-radius:50%;object-fit:cover}
+.tchip.ult{border-color:rgba(251,191,36,.45);background:rgba(251,191,36,.1);color:#fde68a}
+.tchip .tm{font-variant-numeric:tabular-nums;color:var(--faint);font-size:10.5px}
+.tchip .who{color:var(--faint);font-size:10.5px}
+
+/* next focus + legend */
+.next{padding:16px 18px;border-radius:var(--r);background:rgba(167,139,250,.08);
+  border:1px solid rgba(167,139,250,.2)}
+.next .k{color:var(--accent)}
+.next ol{margin:0;padding:0;list-style:none;display:grid;gap:9px}
+.next li{display:flex;gap:10px;align-items:flex-start;font-size:13.5px;color:var(--muted)}
+.next .n{flex:0 0 auto;width:19px;height:19px;border-radius:50%;background:var(--accent-dim);
+  color:var(--accent);font-size:10.5px;font-weight:700;display:grid;place-items:center;margin-top:2px}
+.leg{font-size:11.5px;color:var(--faint);line-height:1.7;padding-top:14px;
+  border-top:1px solid var(--line-soft)}
+.sw{display:inline-block;width:9px;height:9px;border-radius:50%;margin:0 5px 0 14px;
+  vertical-align:middle}
+
+/* ---------- damage profile ---------- */
+.dsplit{display:flex;height:10px;border-radius:99px;overflow:hidden;background:var(--bg-soft);
+  margin:4px 0 9px}
+.dsplit i{display:block;height:100%}
+.dlegend{display:flex;gap:16px;flex-wrap:wrap;margin-bottom:16px}
+.dlg{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);
+  text-transform:capitalize}
+.dlg b{width:9px;height:9px;border-radius:2px;display:inline-block}
+.dcols{display:grid;grid-template-columns:minmax(0,1.6fr) minmax(0,1fr);gap:22px;align-items:start}
+.drow2{display:grid;grid-template-columns:30px minmax(0,1fr) auto;gap:10px;align-items:center;
+  padding:5px 0}
+.drow2 img,.drow2 .dic{width:30px;height:30px;border-radius:7px;object-fit:cover;
+  background:var(--bg-soft);display:grid;place-items:center;font-size:13px;color:var(--faint)}
+.dn{font-size:12.5px;font-weight:600;margin-bottom:4px}
+.dbar{height:5px;border-radius:99px;background:rgba(0,0,0,.35);overflow:hidden}
+.dbar i{display:block;height:100%;border-radius:99px}
+.dv{font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums}
+.dheroes{display:grid;gap:7px}
+.dhero{display:flex;align-items:center;gap:9px;padding:7px 9px;border-radius:var(--r-sm);
+  background:var(--bg-soft);border:1px solid var(--line-soft)}
+.dhero img{width:28px;height:28px;border-radius:7px;object-fit:cover}
+.dhero b{display:block;font-size:12.5px;font-weight:650}
+.dhero span{font-size:11px;color:var(--faint)}
+@media (max-width:760px){ .dcols{grid-template-columns:1fr} }
+
+/* ---------- responsive ---------- */
+@media (max-width:1360px){
+  .stage{grid-template-columns:186px minmax(0,1fr) 186px;gap:12px}
 }
-@media (max-width:860px){
-  body{overflow:auto}.app{height:auto;min-height:100vh}
-  .main{flex-direction:column}
-  .rail,.panel{width:100%;border:0}
-  .rail{max-height:200px;border-bottom:1px solid var(--line-soft)}
-  .map-stage{max-height:none;width:min(92vw,640px);height:auto}
+@media (max-width:1120px){
+  .stage{grid-template-columns:1fr}
+  .team-col{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px}
+  .team-col h3{grid-column:1/-1}
+  #team-radiant{order:2} .mapwrap{order:1} #team-dire{order:3}
+  .map-stage{max-width:640px;margin:0 auto}
+}
+@media (max-width:760px){
+  .wrap{padding:0 14px 56px}
+  .hh-in{padding:12px 14px}
+  .hh-stats{margin-left:0;width:100%;justify-content:space-between;gap:12px}
+  .hh-stat{text-align:left}
+  .verdict{padding:20px 18px}
+  .verdict h1{font-size:21px}
+  .team-col{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .transport{flex-wrap:wrap;gap:12px}
+  .panel{padding:18px 16px}
 }
 </style>
 </head><body>
 <div class="app">
-  <header class="board">
-    <div class="team radiant" id="sb-radiant"></div>
-    <div class="mid">
-      <div class="brand">Replay <em>Coach</em></div>
-      <div class="meta" id="h-sub"></div>
+  <header class="hero-head">
+    <div class="hh-in">
+      <div class="hh-id">
+        <img class="hh-por" id="hh-por" alt="">
+        <div>
+          <div class="hh-name" id="hh-name"></div>
+          <div class="hh-sub" id="h-sub"></div>
+        </div>
+      </div>
+      <div class="hh-stats" id="hh-stats"></div>
+      <div class="hh-draft">
+        <div class="team radiant" id="sb-radiant"></div>
+        <span class="vs">VS</span>
+        <div class="team dire" id="sb-dire"></div>
+      </div>
     </div>
-    <div class="team dire" id="sb-dire"></div>
   </header>
 
-  <div class="main">
-    <aside class="rail">
-      <div class="rail-head">
-        <h2>Your deaths</h2>
+  <main class="wrap">
+    <section class="verdict" id="verdict"></section>
+    <div class="habit" id="habit"></div>
+
+    <section class="sec" id="review-sec">
+      <div class="sec-head">
+        <h2>The review</h2>
+        <span class="hint">What held up, and what cost you</span>
+      </div>
+      <div class="cols" id="review"></div>
+      <div class="card itemcard sec" id="dmgreview" style="margin-top:18px"></div>
+      <div class="card itemcard sec" id="itemreview" style="margin-top:18px"></div>
+    </section>
+
+    <section class="sec">
+      <div class="sec-head">
+        <h2>Death review</h2>
+        <span class="hint">Pick a death, then scrub the ten seconds before it</span>
+      </div>
+      <div class="strip-head">
         <div class="sort">
           <button type="button" id="sort-priority" class="on">Most important</button>
           <button type="button" id="sort-time">By time</button>
         </div>
       </div>
-      <div id="deathlist"></div>
-    </aside>
+      <div class="strip" id="deathlist"></div>
 
-    <section class="mapwrap">
-      <div class="map-stage">
-        <svg id="map" viewBox="0 0 640 640" role="img" aria-label="Minimap playback">
-          <image id="map-bg" href="__MAP2_B64__" x="0" y="0" width="640" height="640"></image>
-          <g id="ov"></g>
-        </svg>
-        <button type="button" class="map-toggle" id="map-toggle">Map: In-game</button>
-      </div>
-      <div class="transport">
-        <button type="button" class="play" id="btn-play" aria-label="Play or pause">▶</button>
-        <div class="scrub">
-          <input type="range" id="scrub" min="0" max="20" step="1" value="20">
-          <div class="times"><span id="t-rel">-10.0s</span><strong id="t-clock">0:00</strong><span>death</span></div>
+      <div class="stage">
+        <aside class="team-col" id="team-radiant"></aside>
+        <div class="mapwrap">
+          <div class="map-stage">
+            <svg id="map" viewBox="0 0 640 640" role="img" aria-label="Minimap playback">
+              <image id="map-bg" href="__MAP2_B64__" x="0" y="0" width="640" height="640"></image>
+              <g id="ov"></g>
+            </svg>
+            <button type="button" class="map-toggle" id="map-toggle">Map: In-game</button>
+          </div>
+          <div class="transport">
+            <button type="button" class="play" id="btn-play" aria-label="Play or pause">&#9654;</button>
+            <div class="scrub">
+              <input type="range" id="scrub" min="0" max="20" step="1" value="20">
+              <div class="times"><span id="t-rel">-10.0s</span><strong id="t-clock">0:00</strong><span>death</span></div>
+            </div>
+            <div class="nav-death">
+              <button type="button" id="prev" aria-label="Previous death">&lsaquo;</button>
+              <span id="pos">1/1</span>
+              <button type="button" id="next" aria-label="Next death">&rsaquo;</button>
+              <span class="kbd">Space</span>
+            </div>
+          </div>
         </div>
-        <div class="nav-death">
-          <button type="button" id="prev" aria-label="Previous death">‹</button>
-          <span id="pos">1/1</span>
-          <button type="button" id="next" aria-label="Next death">›</button>
-          <span class="kbd">Space</span>
-        </div>
+        <aside class="team-col" id="team-dire"></aside>
       </div>
+
+      <div class="card panel" id="panel" aria-live="polite"></div>
     </section>
-
-    <aside class="panel" id="panel" aria-live="polite"></aside>
-  </div>
+  </main>
 </div>
 
 <script>
@@ -1137,19 +1764,11 @@ function clock(t){
 }
 function teamColor(m){ return m.isRadiant ? "#3dca8a" : "#ef5b5b"; }
 
-// Jump classification (640px map ≈ 4.32px per grid; blink ~1200u ≈ 40px).
-// Mid-range jumps are Blink (dagger / blink abilities). Only long jumps are TP.
-const BLINK_MIN_PX = 22;   // above force-staff-ish hops
-const BLINK_MAX_PX = 58;   // blink range + margin
-const TP_MIN_PX = 70;      // clearly beyond blink → town portal / BoTs
-
-function classifyJump(from, to){
-  const dist = Math.hypot(to.x - from.x, to.y - from.y);
-  if (dist >= TP_MIN_PX) return {kind: "tp", dist};
-  if (dist >= BLINK_MIN_PX && dist <= BLINK_MAX_PX) return {kind: "blink", dist};
-  if (dist >= 14 && dist < BLINK_MIN_PX && to.hasForce) return {kind: "force", dist};
-  return null;
-}
+// Jump labels come from Python (`m.jump`), which resolves them against real
+// cast data — a Pudge hook on you is "Hooked", not a Blink you never owned.
+// Distance alone is only used to decide a jump happened at all.
+const JUMP_MIN_PX = 22;
+const TP_MIN_PX = 70;      // clearly beyond blink range
 
 function marker(m){
   // Larger circular portraits + status badges above the hero.
@@ -1169,11 +1788,18 @@ function marker(m){
     g.appendChild(el("circle", {cx:m.x, cy:m.y, r:r, fill:"#1a2230"}));
   }
   g.appendChild(el("circle", {
-    cx:m.x, cy:m.y, r:r, fill:"none", stroke:"#070a0e", "stroke-width": 2.4
+    cx:m.x, cy:m.y, r:r, fill:"none", stroke:"#070a0e", "stroke-width": 1.8
   }));
   g.appendChild(el("circle", {
-    cx:m.x, cy:m.y, r:r, fill:"none", stroke:col, "stroke-width": 2
+    cx:m.x, cy:m.y, r:r, fill:"none", stroke:col, "stroke-width": 1.3
   }));
+  // "You" gets a thin ring hugging the portrait instead of a big red circle.
+  if (m.me){
+    g.appendChild(el("circle", {
+      cx:m.x, cy:m.y, r:r + 2.5, fill:"none", stroke:"#fbbf24",
+      "stroke-width": 1, opacity: .95
+    }));
+  }
   const statuses = m.statuses || [];
   statuses.slice(0, 2).forEach((s, i) => {
     const y = m.y - r - 10 - i * 11;
@@ -1191,23 +1817,24 @@ function marker(m){
   title.textContent = m.name + (m.isRadiant ? " · Radiant" : " · Dire")
     + (m.me ? " · you" : "")
     + (st ? " · " + st : "")
-    + (m.hasBlink ? " · Blink" : "")
-    + (m.jumpKind === "tp" ? " · teleporting" : "")
-    + (m.jumpKind === "blink" ? " · blinking" : "");
+    + (m.hasBlink ? " · owns Blink" : "")
+    + (m.jump ? " · " + m.jump : "");
   g.appendChild(title);
   return g;
 }
 
-function drawJump(from, to, kind){
-  const col = kind === "tp" ? "#c9a227" : (kind === "force" ? "#7ec8ff" : "#d7e6ff");
-  const label = kind === "tp" ? "TP" : (kind === "force" ? "Force" : "Blink");
+function drawJump(from, to, label, isTP){
+  // Unexplained jumps get a neutral line and no caption — better silent than
+  // captioned with a mechanic that didn't happen.
+  const col = isTP ? "#c9a227" : (label ? "#d7e6ff" : "#7c8794");
   ov.appendChild(el("line", {
     x1: from.x, y1: from.y, x2: to.x, y2: to.y,
-    stroke: col, "stroke-width": kind === "tp" ? 1.8 : 1.4,
-    "stroke-dasharray": kind === "tp" ? "6 4" : "3 3",
-    opacity: .92, "stroke-linecap": "round"
+    stroke: col, "stroke-width": isTP ? 1.8 : 1.4,
+    "stroke-dasharray": isTP ? "6 4" : "3 3",
+    opacity: label ? .92 : .5, "stroke-linecap": "round"
   }));
   ov.appendChild(el("circle", {cx: from.x, cy: from.y, r: 2.0, fill: col, opacity: .75}));
+  if (!label) return;
   const mx = (from.x + to.x) / 2, my = (from.y + to.y) / 2;
   const lab = el("text", {
     x: mx, y: my - 5, fill: col, "font-size": 9, "font-weight": 700,
@@ -1226,7 +1853,7 @@ function pathUntil(points, t){
   for (let i=1;i<pts.length;i++){
     const d = Math.hypot(pts[i][0]-pts[i-1][0], pts[i][1]-pts[i-1][1]);
     // Break trail across blinks/TPs so the walking path stays readable.
-    if (d > BLINK_MIN_PX){ if (cur.length>1) segs.push(cur); cur = [pts[i]]; }
+    if (d > JUMP_MIN_PX){ if (cur.length>1) segs.push(cur); cur = [pts[i]]; }
     else cur.push(pts[i]);
   }
   if (cur.length>1) segs.push(cur);
@@ -1241,14 +1868,24 @@ function drawFrame(D, fi){
   const prevBy = Object.fromEntries(prev.map(m => [m.heroId, m]));
   for (const m of marks){
     const p = prevBy[m.heroId];
-    const jump = p ? classifyJump(p, m) : null;
-    m.jumpKind = jump ? jump.kind : null;
+    m.jumpDist = p ? Math.hypot(m.x - p.x, m.y - p.y) : 0;
   }
   const meM = marks.find(m => m.me) || marks[0];
-  ov.innerHTML = "";
+  ov.replaceChildren();
 
   const dead = new Set(F.deadBuildings);
   const sz = {tower:16, rax:13, fort:28};
+  // Standing towers grant vision — draw your team's radius so "no vision"
+  // deaths can be judged honestly against what you could actually see.
+  for (const b of R.buildings){
+    if (dead.has(b.key) || b.kind !== "tower") continue;
+    if (b.isRadiant !== R.hero.isRadiant) continue;
+    ov.appendChild(el("circle", {
+      cx:b.x, cy:b.y, r:R.towerVisionR, fill:"#7dd3fc", opacity:.05,
+      stroke:"#7dd3fc", "stroke-width":.7, "stroke-opacity":.28,
+      "stroke-dasharray":"2 6"
+    }));
+  }
   for (const b of R.buildings){
     if (dead.has(b.key)) continue;
     const s = sz[b.kind] || 14;
@@ -1256,21 +1893,17 @@ function drawFrame(D, fi){
   }
   for (const w of F.wards){
     const kind = w.kind || "observer";
-    const icon = kind === "sentry" ? "ward_sentry.png" : "ward_observer.png";
+    // Colour carries the team (blue = yours, red = theirs); shape carries the
+    // type (eye = observer, oval = sentry). No extra dot needed.
+    const mine = w.isRadiant === R.hero.isRadiant;
+    const icon = `ward_${kind === "sentry" ? "sentry" : "observer"}_${mine ? "ally" : "enemy"}.png`;
     const href = SPR[icon];
     // Glyphs are 35x27 — keep that aspect so the eye reads as an eye.
     const gw = kind === "sentry" ? 16 : 18;
     const gh = Math.round(gw * 27 / 35);
     if (href){
       ov.appendChild(el("image", {
-        href, x: w.x - gw/2, y: w.y - gh/2, width: gw, height: gh,
-        opacity: w.isRadiant ? 0.95 : 0.88
-      }));
-      // Tiny team tint under the icon so Radiant/Dire stay clear.
-      ov.appendChild(el("circle", {
-        cx: w.x, cy: w.y + gh/2 + 1, r: 2.2,
-        fill: w.isRadiant ? "#4ade80" : "#f87171",
-        stroke: "#070a0e", "stroke-width": 0.8
+        href, x: w.x - gw/2, y: w.y - gh/2, width: gw, height: gh, opacity: 0.95
       }));
     } else {
       const col = kind === "sentry" ? "#7dd3fc" : (w.isRadiant ? "#e0b83a" : "#b56fd4");
@@ -1288,72 +1921,47 @@ function drawFrame(D, fi){
   }
 
   for (const m of marks){
-    if (!m.jumpKind) continue;
+    if (!m.jumpDist || m.jumpDist < JUMP_MIN_PX) continue;
     const p = prevBy[m.heroId];
-    if (p) drawJump(p, m, m.jumpKind);
+    if (p) drawJump(p, m, m.jump || null, m.jumpDist >= TP_MIN_PX);
   }
 
-  // Ultimate casts near this frame — gold burst + ability icon at caster.
-  const ULT_SHOW = 1.6;
-  for (const u of (pb.ultCasts || [])){
+  // Spell casts — a brief icon that pops above the caster and fades. No rings,
+  // no "ULT" label: the icon already says which spell it was.
+  const CAST_SHOW = 0.9;                       // seconds visible
+  for (const u of (pb.casts || [])){
     const age = F.t - u.t;
-    if (age < -0.05 || age > ULT_SHOW) continue;
-    const fade = 1 - age / ULT_SHOW;
-    const col = u.me ? "#fbbf24" : (u.isRadiant ? "#4ade80" : "#f87171");
-    // Prefer live hero position if they're on this frame.
+    if (age < -0.05 || age > CAST_SHOW) continue;
+    const fade = 1 - age / CAST_SHOW;          // 1 at cast -> 0 when gone
     const live = marks.find(m => m.heroId === u.heroId);
     const cx = live ? live.x : u.x;
     const cy = live ? live.y : u.y;
-    ov.appendChild(el("circle", {
-      cx, cy, r: 18 + fade * 10, fill: "none", stroke: col,
-      "stroke-width": 2.2, opacity: 0.25 + fade * 0.55
+    if (!u.icon) continue;
+    const s = (u.ult ? 20 : 16) * (0.75 + 0.25 * fade);   // small pop-in
+    const g = el("g", {opacity: Math.min(1, 0.35 + fade)});
+    g.appendChild(el("rect", {
+      x: cx - s/2 - 1.5, y: cy - 30 - s/2 - 1.5, width: s + 3, height: s + 3,
+      rx: 4, fill: "#070a0e", opacity: 0.75
     }));
-    ov.appendChild(el("circle", {
-      cx, cy, r: 12, fill: col, opacity: 0.12 + fade * 0.18
+    g.appendChild(el("image", {
+      href: u.icon, x: cx - s/2, y: cy - 30 - s/2, width: s, height: s
     }));
-    if (u.icon){
-      const s = 18;
-      ov.appendChild(el("image", {
-        href: u.icon, x: cx - s/2, y: cy - 34, width: s, height: s,
-        opacity: 0.55 + fade * 0.45
+    if (u.ult){                                 // thin gold edge marks an ult
+      g.appendChild(el("rect", {
+        x: cx - s/2 - 1.5, y: cy - 30 - s/2 - 1.5, width: s + 3, height: s + 3,
+        rx: 4, fill: "none", stroke: "#fbbf24", "stroke-width": 1.2
       }));
     }
-    const lab = el("text", {
-      x: cx, y: cy - 38, fill: "#ffe6a0", "font-size": 8, "font-weight": 700,
-      "font-family": "Outfit, sans-serif", "text-anchor": "middle",
-      stroke: "#070a0e", "stroke-width": 2.5, "paint-order": "stroke",
-      opacity: 0.65 + fade * 0.35
-    });
-    lab.textContent = "ULT";
-    ov.appendChild(lab);
-  }
-
-  // Item uses — smaller cyan/amber icon ping near the user.
-  const ITEM_SHOW = 1.4;
-  for (const it of (pb.itemCasts || [])){
-    const age = F.t - it.t;
-    if (age < -0.05 || age > ITEM_SHOW) continue;
-    const fade = 1 - age / ITEM_SHOW;
-    const live = marks.find(m => m.heroId === it.heroId);
-    const cx = live ? live.x : it.x;
-    const cy = live ? live.y : it.y;
-    const col = "#67e8f9";
-    ov.appendChild(el("circle", {
-      cx, cy, r: 15 + fade * 6, fill: "none", stroke: col,
-      "stroke-width": 1.6, opacity: 0.2 + fade * 0.45,
-      "stroke-dasharray": "3 2"
-    }));
-    if (it.icon){
-      const s = 14;
-      ov.appendChild(el("image", {
-        href: it.icon, x: cx + 10, y: cy - 18, width: s, height: s,
-        opacity: 0.55 + fade * 0.45
-      }));
-    }
+    const t = document.createElementNS(NS, "title");
+    t.textContent = `${u.hero}: ${u.name}`;
+    g.appendChild(t);
+    ov.appendChild(g);
   }
 
   for (const m of marks) if (!m.me) ov.appendChild(marker(m));
   if (meM) ov.appendChild(marker(meM));
+
+  paintSpectator(D, F);
 
   const aliveIds = new Set(F.markers.map(m => m.heroId));
   const killerIds = new Set(F.markers.filter(m => m.killer).map(m => m.heroId));
@@ -1366,6 +1974,77 @@ function drawFrame(D, fi){
   document.getElementById("t-rel").textContent = (F.rel >= 0 ? "+" : "") + F.rel.toFixed(1) + "s";
   document.getElementById("t-clock").textContent = clock(F.t);
   document.getElementById("scrub").value = String(fi);
+}
+
+// Spectator rail: every hero's live level / hp / mana / statuses at the current
+// scrubber position, plus their items at the moment of death.
+function specRow(h, m, items){
+  const side = h.isRadiant ? "radiant" : "dire";
+  const cls = [side, h.me ? "me" : "", m ? "" : "dead"].filter(Boolean).join(" ");
+  // Live values at the scrubbed moment. h.stats holds END-OF-MATCH totals and
+  // must never be shown against a timestamp — 172 CS at 1:19 is how that reads.
+  const L = (m && m.live) || null;
+  const head = `<div class="hd">
+      ${h.icon?`<img class="hp" src="${esc(h.icon)}" alt="">`:"<div></div>"}
+      <div><div class="nm">${h.pos?`<b class="po">${h.pos}</b>`:""}${esc(h.name)}</div>
+        <div class="kda">${L ? `${L.k}/${L.d}/${L.a}` : "&mdash;"}</div></div>
+      <span class="lvl">${m ? "L"+(m.level ?? "?") : "dead"}</span>
+    </div>`;
+  if (!m) return `<div class="srow ${cls}">${head}</div>`;
+  const up = m.up || {};
+  const badges = (up.scepter?`<span class="upg ag" title="Aghanim's Scepter">A</span>`:"")
+               + (up.shard?`<span class="upg sh" title="Aghanim's Shard">S</span>`:"");
+  const kit = (R.kits || {})[h.heroId] || [];
+  const abs = kit.map((a, i) => {
+    const cd = (m.ab || [])[i];
+    if (cd === -2) return "";              // scepter/shard skill they don't own
+    const state = cd === -1 ? "locked" : cd > 0 ? "cool" : "up";
+    return `<span class="ab ${state}" title="${esc(a.name || "")}${
+        cd > 0 ? " — "+cd+"s" : cd === -1 ? " — not skilled" : " — ready"}">
+      ${a.icon?`<img src="${esc(a.icon)}" alt="">`:""}
+      ${cd > 0 ? `<i>${cd}</i>` : ""}</span>`;
+  }).join("");
+  const slots = [];
+  for (let i=0;i<6;i++){
+    const it = (items||[])[i];
+    slots.push(it && it.icon
+      ? `<img src="${esc(it.icon)}" title="${esc(it.name)}" alt="">`
+      : `<div class="sl"></div>`);
+  }
+  const st = (m.statuses || []).slice(0,3).map(x =>
+    `<span style="color:${esc(x.color)}">${esc(x.label)}</span>`).join("");
+  return `<div class="srow ${cls}">
+    ${head}
+    ${(abs||badges)?`<div class="abs">${abs}${badges}</div>`:""}
+    <div class="bars">
+      <div class="sbar"><i style="width:${pct(m.hp,m.maxHp)}%;background:#4ade80"></i></div>
+      <div class="sbar"><i style="width:${pct(m.mp,m.maxMp)}%;background:#3d9be9"></i></div>
+    </div>
+    ${L ? `<div class="num"><span>${L.cs ?? 0} cs</span><span>${
+       L.gold != null ? (L.gold/1000).toFixed(1)+"k net" : ""}</span></div>` : ""}
+    <div class="its">${slots.join("")}</div>
+    ${st?`<div class="st">${st}</div>`:""}
+  </div>`;
+}
+
+function paintSpectator(D, F){
+  const rad = document.getElementById("team-radiant");
+  const dire = document.getElementById("team-dire");
+  if (!rad || !dire) return;
+  const itemsBy = {};
+  for (const row of (D.allyLoadouts || []).concat(D.enemyLoadouts || [])){
+    itemsBy[row.heroId] = row.items || [];
+  }
+  // The player themselves is in neither loadout list — their inventory is
+  // D.items — so without this their own row showed six empty slots.
+  itemsBy[R.hero.heroId] = D.items || [];
+  const byId = Object.fromEntries(F.markers.map(m => [m.heroId, m]));
+  const draw = (box, list, label, colour) => {
+    box.innerHTML = `<h3 style="color:${colour}">${label}</h3>` +
+      list.map(h => specRow(h, byId[h.heroId], itemsBy[h.heroId])).join("");
+  };
+  draw(rad, R.scoreboard.radiant, "Radiant", "var(--radiant)");
+  draw(dire, R.scoreboard.dire, "Dire", "var(--dire)");
 }
 
 function stopPlay(){
@@ -1414,33 +2093,130 @@ function paintList(){
   nav.innerHTML = "";
   order.forEach(i => {
     const d = R.deaths[i];
-    const div = document.createElement("div");
-    div.className = "drow" + (i === cur ? " on" : "");
-    div.innerHTML =
-      `<span class="dot ${esc(d.severity.key)}"></span>
-       <div><div class="clock">${esc(d.clock)}</div><div class="title">${esc(d.title)}</div>
-       <div class="sev">${esc(d.severity.label)}</div></div>
-       <span class="num">#${d.idx+1}</span>`;
-    div.onclick = () => show(i);
-    nav.appendChild(div);
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "dcard" + (i === cur ? " on" : "");
+    const inHabit = (R.habit && R.habit.headline && (R.habit.headline.deaths||[]).includes(d.idx));
+    b.innerHTML =
+      `<div class="row1"><span class="dot ${esc(d.severity.key)}"></span>
+         <span class="clock">${esc(d.clock)}</span>
+         <span class="num">#${d.idx+1}</span></div>
+       <div class="title">${esc(d.title)}</div>
+       ${inHabit ? `<span class="flag">pattern</span>` : ""}`;
+    b.onclick = () => show(i);
+    nav.appendChild(b);
   });
+}
+
+/* The takeaway, above everything else: verdict, then strengths/mistakes,
+   then itemisation. An average reader should be able to stop after this. */
+function paintReview(){
+  const H = R.hero, S = R.summary, CO = R.coach;
+  const por = document.getElementById("hh-por");
+  if (H.icon) por.src = H.icon; else por.remove();
+  const result = H.won == null ? "" : H.won
+    ? `<span class="badge win">Victory</span>` : `<span class="badge loss">Defeat</span>`;
+  document.getElementById("hh-name").innerHTML = `${esc(H.name)} ${result}`;
+  document.getElementById("h-sub").textContent =
+    `${H.side} · match ${R.matchId}`;
+
+  const meRow = R.scoreboard.radiant.concat(R.scoreboard.dire).find(p => p.me) || {};
+  const st = meRow.stats || {};
+  const stat = (v, label) => v == null ? "" :
+    `<div class="hh-stat"><b>${esc(String(v))}</b><span>${esc(label)}</span></div>`;
+  document.getElementById("hh-stats").innerHTML =
+    stat(`${st.k ?? 0}/${st.d ?? 0}/${st.a ?? 0}`, "K/D/A")
+    + stat(st.cs, "last hits") + stat(st.gpm, "GPM") + stat(st.xpm, "XPM")
+    + stat(S.deathCount, "deaths");
+
+  const V = document.getElementById("verdict");
+  if (CO && CO.headline){
+    V.innerHTML = `<div class="eyebrow">Your one habit this match</div>
+      <h1>${esc(CO.headline)}</h1>
+      ${CO.fix ? `<p class="fix">${esc(CO.fix)}</p>` : ""}
+      ${CO.overall ? `<p class="overall">${esc(CO.overall)}</p>` : ""}
+      ${CO.drill ? `<div class="drill"><b>Next game:</b><span>${esc(CO.drill)}</span></div>` : ""}`;
+  } else {
+    // No AI pass — fall back to the measured habit so the page still leads
+    // with a conclusion rather than a wall of deaths.
+    const hb = R.habit && R.habit.headline;
+    V.innerHTML = hb
+      ? `<div class="eyebrow">Your one habit this match</div>
+         <h1>${esc(hb.title)}</h1><p class="fix">${esc(hb.text)}</p>`
+      : `<div class="eyebrow">Match review</div>
+         <h1>${S.deathCount} deaths, ${S.totalGoldLost} gold handed over</h1>
+         <p class="fix">Pick a death below to see what happened in the ten seconds before it.</p>`;
+    if (!hb && !S.deathCount) V.style.display = "none";
+  }
+
+  const pts = (arr) => (arr || []).map(p =>
+    `<div class="pt"><p class="ptt">${esc(p.title)}</p><p class="ptx">${esc(p.detail)}</p></div>`).join("");
+  const rev = document.getElementById("review");
+  const good = CO && CO.did_well && CO.did_well.length;
+  const bad  = CO && CO.mistakes && CO.mistakes.length;
+  rev.innerHTML =
+    (good ? `<div class="card colcard good"><h3><span class="ic">&#10003;</span>What held up</h3>
+       ${pts(CO.did_well)}</div>` : "")
+    + (bad ? `<div class="card colcard bad"><h3><span class="ic">&#33;</span>What cost you</h3>
+       ${pts(CO.mistakes)}</div>` : "");
+  const DM = R.damage;
+  const dmgEl = document.getElementById("dmgreview");
+  if (DM && DM.sources && DM.sources.length){
+    const COL = {magical:"#60a5fa",physical:"#fbbf24",pure:"#f472b6",unknown:"#94a3b8"};
+    const bar = DM.split.map(s =>
+      `<i style="width:${s.pct}%;background:${COL[s.type]||COL.unknown}" title="${s.type} ${s.pct}%"></i>`).join("");
+    const legend = DM.split.map(s =>
+      `<span class="dlg"><b style="background:${COL[s.type]||COL.unknown}"></b>${s.type} ${s.pct}%</span>`).join("");
+    const max = DM.sources[0].damage || 1;
+    const rows = DM.sources.map(r => `
+      <div class="drow2">
+        ${r.icon?`<img src="${esc(r.icon)}" alt="">`:`<div class="dic">&#9876;</div>`}
+        <div><div class="dn">${esc(r.name)}</div>
+          <div class="dbar"><i style="width:${Math.round(100*r.damage/max)}%;
+            background:${COL[r.type]||COL.unknown}"></i></div></div>
+        <div class="dv">${r.damage.toLocaleString()}</div>
+      </div>`).join("");
+    const heroes = (DM.heroes||[]).map(h => `
+      <div class="dhero" title="${esc(h.name)}">
+        ${h.icon?`<img src="${esc(h.icon)}" alt="">`:""}
+        <div><b>${esc(h.name)}</b><span>${h.damage.toLocaleString()} dmg${
+          h.kills?` · ${h.kills} kill${h.kills>1?"s":""}`:""}</span></div></div>`).join("");
+    dmgEl.innerHTML = `<div class="eyebrow">What actually damages you</div>
+      <div class="dsplit">${bar}</div><div class="dlegend">${legend}</div>
+      <div class="dcols"><div>${rows}</div><div class="dheroes">${heroes}</div></div>
+      <p class="hint">Whole-match totals. OpenDota reports damage by inflictor for the
+        match, not per death, so this is a pattern — not a breakdown of any one death.</p>`;
+  } else if (dmgEl) { dmgEl.remove(); }
+
+  const item = document.getElementById("itemreview");
+  if (CO && CO.itemization){
+    item.innerHTML = `<div class="eyebrow">Itemisation</div><p>${esc(CO.itemization)}</p>`;
+  } else { item.remove(); }
+  if (!good && !bad) document.getElementById("review-sec").style.display = "none";
 }
 
 function paintBoard(){
   const paint = (elId, rows) => {
-    const root = document.getElementById(elId);
-    root.innerHTML = rows.map(h => `
-      <div class="slot ${h.isRadiant?"radiant":"dire"}${h.me?" me":""}" data-hero-id="${h.heroId}" title="${esc(h.name)}">
+    document.getElementById(elId).innerHTML = rows.map(h => `
+      <div class="slot ${h.isRadiant?"radiant":"dire"}${h.me?" me":""}" data-hero-id="${h.heroId}" title="${esc(h.name)}${h.pos?" · pos "+h.pos:""}">
         ${h.icon ? `<img src="${esc(h.icon)}" alt="${esc(h.name)}">` : ""}
       </div>`).join("");
   };
   paint("sb-radiant", R.scoreboard.radiant);
   paint("sb-dire", R.scoreboard.dire);
-  const H = R.hero, S = R.summary;
-  const result = H.won == null ? "" : H.won
-    ? `<span class="badge win">Victory</span>` : `<span class="badge loss">Defeat</span>`;
-  document.getElementById("h-sub").innerHTML =
-    `${esc(H.name)} · ${esc(H.side)} · match ${R.matchId} · ${S.deathCount} deaths ${result}`;
+  paintReview();
+
+  const hb = R.habit && R.habit.headline;
+  const nem = R.habit && R.habit.nemesis;
+  const habitEl = document.getElementById("habit");
+  if (!nem && !(hb && R.coach)){ habitEl.remove(); return; }
+  const nemIcon = nem ? (R.scoreboard.radiant.concat(R.scoreboard.dire)
+    .find(p => p.heroId === nem.heroId) || {}).icon : null;
+  habitEl.innerHTML =
+    (hb && R.coach ? `<span><b>Measured pattern:</b> ${esc(hb.text)}</span>` : "")
+    + (nem ? `<span class="nem" style="margin-left:auto">
+        ${nemIcon?`<img src="${esc(nemIcon)}" alt="">`:""}
+        <b>${esc(nem.name)}</b> killed you ${nem.count}&times;</span>` : "");
 }
 
 function paintPanel(D, meM){
@@ -1569,6 +2345,14 @@ function paintPanel(D, meM){
     <h1>${esc(D.title)}</h1>
     <p class="blurb">${esc(D.blurb)} <span style="color:var(--faint)">· ${esc(D.clock)} · death #${D.idx+1}</span></p>
     ${chips ? `<div class="chips" style="margin:0 0 18px">${chips}</div>` : ""}
+    ${D.diagnosis ? `<div class="diag ${esc(D.diagnosis.kind)}">
+      <span class="k">${D.diagnosis.kind === "awareness" ? "Awareness miss"
+        : D.diagnosis.kind === "execution" ? "Execution miss" : "Fight commitment"}</span>
+      <p class="t">${esc(D.diagnosis.title)}</p>
+      <p class="x">${esc(D.diagnosis.text)}</p>
+    </div>` : ""}
+    ${D.aiAdvice ? `<div class="coach"><span class="k">Coach · do this instead</span>
+      <p class="x" style="margin:0">${esc(D.aiAdvice)}</p></div>` : ""}
     <div class="lesson">
       <span class="k">Key lesson</span>
       <p class="t">${esc(D.tip)}</p>
@@ -1583,10 +2367,10 @@ function paintPanel(D, meM){
       ${meM && meM.level != null ? `<div class="lvl" style="margin-top:10px;height:44px">Level ${meM.level}</div>`:""}
       <div style="margin-top:12px" id="live-status">${statusHtml}</div>
     </div>
-    <details class="sec" open><summary>Who was here · ${counts.allies||0} allies · ${counts.enemies||0} enemies</summary>
+    <details class="sec"><summary>Who was here · ${counts.allies||0} allies · ${counts.enemies||0} enemies</summary>
       <div class="inner"><div class="roster">${roster}</div></div></details>
     <details class="sec"><summary>Items at that moment</summary><div class="inner">
-      <div class="subh">Your items</div><div class="items">${inv||`<span class="chip">No item data</span>`}</div>
+      <div class="subh">Your items</div><div class="items">${inv||`<span class="chip">No notable items yet at this point</span>`}</div>
       <div class="subh">Allies</div><div class="eload">${allyLoadouts||`<span class="chip">No allies</span>`}</div>
       <div class="subh">Enemies</div><div class="eload">${enemyLoadouts||`<span class="chip">No enemies</span>`}</div>
       <div class="hint">Estimated from purchase logs — consumed or sold items may still show.</div>
@@ -1646,15 +2430,16 @@ document.getElementById("sort-time").onclick = () => {
   document.getElementById("sort-priority").classList.remove("on");
   const keep = cur; rebuildOrder(); show(keep);
 };
-// Each map image needs its own placement so the playable area fills the 0..640
-// marker frame. Dark map fills edge-to-edge; the in-game map has a border, so
-// it's scaled up (overhang is clipped by the SVG viewBox). Derived by
-// registering the two images: playable scale 0.8969, insets L 0.0531 / T 0.0406.
+// Both maps are full-frame: grid 54..202 spans the whole image.
+//
+// This was previously scaled by 0.8969 from cross-correlating the two map
+// images, which was wrong and caused visible drift. The geometry settles it:
+// DotaMiniMap renders world [-8600, 8600] with a 0.051 inset, and grid 54..202
+// at ~129.5 world-units per cell is world ±9583 — which lands at fractions
+// 0.000..1.000 of the image. Edge-to-edge, same as the dark map.
 const MB = 640;
-const IN_SCALE = 0.8969, IN_L = 0.0531, IN_T = 0.0406;
-const IN_W = MB / IN_SCALE;
 const MAP_CFG = {
-  ingame: {href:"__MAP2_B64__", x:-IN_L*IN_W, y:-IN_T*IN_W, w:IN_W, h:IN_W, label:"Map: In-game"},
+  ingame: {href:"__MAP2_B64__", x:0, y:0, w:MB, h:MB, label:"Map: In-game"},
   dark:   {href:"__MAP_B64__",  x:0, y:0, w:MB, h:MB, label:"Map: Dark"},
 };
 let mapStyle = "ingame";

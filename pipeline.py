@@ -36,7 +36,7 @@ def _pick(match, account_id: int):
 
 def generate(match_id, account_id, *, wait_parse: bool = True,
              parse_timeout: float = 240, force: bool = False,
-             use_cache: bool = True, log=print) -> dict:
+             use_cache: bool = True, coach: bool = False, log=print) -> dict:
     """Build (or reuse) the report for one player in one match.
 
     Returns {path, match_id, account_id, hero_id, deaths, cached, partial}.
@@ -63,6 +63,7 @@ def generate(match_id, account_id, *, wait_parse: bool = True,
             "old matches may not be available — try again later.")
 
     partial = False
+    od = {}
     log("OpenDota: wards, tower timeline, economy…")
     try:
         od = opendota.fetch(match_id, ensure=True, wait_parse=wait_parse,
@@ -87,7 +88,31 @@ def generate(match_id, account_id, *, wait_parse: bool = True,
     if not ranked:
         raise PipelineError("No deaths found for this player — nothing to review.")
 
-    render(match, me, ranked, path)
+    advice = None
+    if coach:
+        log("Asking Grok for targeted coaching…")
+        import coach as coach_mod
+        import diagnose
+        diags = {}
+        for a in ranked:
+            dg = diagnose.movement(match, me, a)
+            if dg:
+                diags[a.index] = dg
+        import heroes as _h
+        hero = _h.load()
+        habit = diagnose.habits(
+            match, me, ranked, diags, __import__("items").load(),
+            lambda h: (hero.get(str(h), {}).get("name", str(h)), None))
+        import summary as summary_mod
+        try:
+            ms = summary_mod.build(od, match, me, ranked)
+        except Exception as e:                       # summary is additive, never fatal
+            log(f"  (match summary unavailable: {e})")
+            ms = {}
+        advice = coach_mod.advise(
+            coach_mod.build_context(match, me, ranked, diags, habit, ms), log=log)
+
+    render(match, me, ranked, path, coach_advice=advice)
     log("Report ready.")
     return {"path": path, "match_id": match_id, "account_id": account_id,
             "hero_id": me.hero_id, "deaths": len(ranked),

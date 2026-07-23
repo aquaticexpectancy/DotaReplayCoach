@@ -8,6 +8,7 @@ _DIR = os.path.dirname(__file__)
 _IDS_CACHE = os.path.join(_DIR, "ability_ids.json")
 _META_CACHE = os.path.join(_DIR, "abilities_meta.json")
 _HERO_ULT_CACHE = os.path.join(_DIR, "hero_ultimates.json")
+_HERO_ABS_CACHE = os.path.join(_DIR, "hero_abilities_by_id.json")
 _CDN = "https://cdn.cloudflare.steamstatic.com"
 
 _SKIP_KEYS = (
@@ -87,6 +88,23 @@ def _refresh() -> None:
             }
     json.dump(ults, open(_HERO_ULT_CACHE, "w", encoding="utf-8"))
 
+    # hero_id -> [ability ids], so the AI coach can reference real kits.
+    by_hero = {}
+    for npc, row in hero_abs.items():
+        hid = npc_to_hid.get(npc)
+        if hid is None:
+            continue
+        ids = []
+        for k in (row.get("abilities") or []):
+            if not isinstance(k, str) or not k:
+                continue
+            if any(k.startswith(p) or p in k for p in _SKIP_KEYS):
+                continue
+            if k in key_to_id:
+                ids.append(key_to_id[k])
+        by_hero[str(hid)] = ids
+    json.dump(by_hero, open(_HERO_ABS_CACHE, "w", encoding="utf-8"))
+
 
 def load_meta() -> dict:
     if not os.path.exists(_META_CACHE) or not os.path.exists(_HERO_ULT_CACHE):
@@ -106,6 +124,16 @@ def load_ultimates() -> dict:
         load_meta()
     try:
         return json.load(open(_HERO_ULT_CACHE, encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def load_hero_abilities() -> dict:
+    """hero_id (as str) -> [ability_id, ...] in kit order."""
+    if not os.path.exists(_HERO_ABS_CACHE):
+        load_meta()
+    try:
+        return json.load(open(_HERO_ABS_CACHE, encoding="utf-8"))
     except Exception:
         return {}
 

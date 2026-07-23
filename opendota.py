@@ -220,3 +220,19 @@ def attach_economy(match, od: dict) -> None:
         ]
         track.final_items = [p.get(f"item_{s}") or 0 for s in range(6)]
         track.final_neutral = p.get("item_neutral") or None
+        track.lane_role = p.get("lane_role")
+        track.is_roaming = bool(p.get("is_roaming"))
+        # What actually damaged this player, keyed by ability/item name, and
+        # who landed the killing blows. These are WHOLE-MATCH totals — OpenDota
+        # does not attribute damage per death — so they must never be rendered
+        # against a single death's timestamp.
+        track.dmg_received = dict(p.get("damage_inflictor_received") or {})
+        track.dmg_by_unit = dict(p.get("damage_taken") or {})
+        track.killed_by = dict(p.get("killed_by") or {})
+        # End-of-match scoreboard line, for the spectator columns.
+        track.stats = {
+            "k": p.get("kills"), "d": p.get("deaths"), "a": p.get("assists"),
+            "cs": p.get("last_hits"), "gpm": p.get("gold_per_min"),
+            "xpm": p.get("xp_per_min"), "dmg": p.get("hero_damage"),
+            "td": p.get("tower_damage"), "heal": p.get("hero_healing"),
+        }
